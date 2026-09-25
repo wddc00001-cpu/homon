@@ -30,6 +30,9 @@
 //   9. 氏名照合で旧字体・異体字を同じ字とみなす（斎/齋/齊、高/髙、崎/﨑 等。KANJI_VARIANTS）
 //  10. 前回の治療内容の探し方を強化（見出しの言葉が患者ごとに違っても拾える）
 //      行頭の日付で訪問ごとに区切って対象日より前の最新回 → 見出し → 最後の段落のまとまり の順
+//  11. 自動で書き込むのは A〜D列（時間・施設名・№・名前）だけに変更（AUTO_FILL_COLS=4）。
+//      E(治療内容)・F(担当DR)・G(担当DH)以降は人が手入力する（合意済み）。
+//      再実行時、人が入力した行（E列以降に記入／A〜D列を修正）は消さずに残し、同じ予定は作り直さない
 // ============================================================
 // 【v10.0.0 の変更点】
 //   1. 施設フォルダを18件追加（鳴門病院・兼松病院ほか）＝ 計22ルート
@@ -214,6 +217,10 @@ const MAX_RETRY    = 3;           // API一時エラー時のリトライ回数
 // A〜Gのみ自動記入し、H〜T（O/P/Q含む）は手動運用とする。
 // 在/衛訪/衛居宅（O/P/Q）も自動で〇を入れたい場合は true に変更。
 const FILL_VISIT_TYPE = false;
+// 自動で書き込む列数（先頭から）。4 = A〜D（時間・施設名・№・名前）のみ。
+//   E(治療内容)・F(担当DR)・G(担当DH)以降は人が手入力する運用（合意済み）。
+//   ※5以上にするとE列以降も自動記入する（E=治療内容 F=担当DR G=担当DH。FILL_VISIT_TYPE は20で有効）
+const AUTO_FILL_COLS = 4;
 // 要確認理由をT列(備考)にも書き出す場合は true（既定は実行ログにのみ出力）
 const WRITE_BIKO_TO_SHEET = false;
 
@@ -375,10 +382,15 @@ function runSync(targetDate, showPopup) {
   // Step4: 書き込みモード準備
   //   overwrite    : システムが前回入れた行（マーカー付き）を消してから入れ直す
   //   append_dedup : 既存行と重複しないものだけ追記
+  //   ※人が入力した行（E列以降に記入がある／A〜D列を直した）は消さずに残し、同じ予定は作り直さない
   let existingKeys = new Set();
+  let kept = 0;
   if (WRITE_MODE === 'overwrite') {
-    const cleared = clearAutoRows(sheet);
-    if (cleared > 0) Logger.log(`前回の自動生成行を${cleared}行クリアしました`);
+    const res = clearAutoRows(sheet);
+    kept = res.kept;
+    existingKeys = res.keptKeys;
+    if (res.cleared > 0) Logger.log(`前回の自動生成行を${res.cleared}行クリアしました`);
+    if (kept > 0) Logger.log(`人が入力した自動生成行を${kept}行残しました（作り直しません）`);
   } else if (WRITE_MODE === 'append_dedup') {
     existingKeys = loadExistingKeys(sheet);
   }
@@ -421,10 +433,10 @@ function runSync(targetDate, showPopup) {
         continue;
       }
 
-      // F3.5: 治療内容ドキュメントのリンク（または フェーズ2: 中身抽出）
+      // F3.5: 治療内容（E列を自動記入する設定のときだけ記録ドキュメントを読む）
       let contentCell = '';
       let biko        = '';
-      try {
+      if (AUTO_FILL_COLS > C.CONTENT) try {
         if (CONTENT_MODE === 'link') {
           const doc = getLatestDoc(p.folderId);
           if (doc) contentCell = `=HYPERLINK("${doc.url}","${LINK_LABEL}")`;
@@ -468,10 +480,12 @@ function runSync(targetDate, showPopup) {
     const startRow = getWriteStart(sheet, footer);    // フッター手前の最初の空き行
     Logger.log(`レイアウト: フッター行=${footer || '未検出'} / 書込開始=${startRow} / 必要行数=${rows.length}`);
     ensureRoom(sheet, startRow, rows.length, footer); // 不足分の行を確保
-    const range = sheet.getRange(startRow, 1, rows.length, TOTAL_COLS);
-    withRetry(() => range.setValues(rows), 'setValues');
+    // 書き込むのは A〜D列（AUTO_FILL_COLS）だけ。E列以降（人が入力する列）には触れない
+    const range = sheet.getRange(startRow, 1, rows.length, AUTO_FILL_COLS);
+    withRetry(() => range.setValues(rows.map(r => r.slice(0, AUTO_FILL_COLS))), 'setValues');
     // 自動生成行の目印（画面に出ない行メタデータ）を付与 → 次回の上書き対象になる
-    markAutoRows(sheet, startRow, rows.length);
+    //   目印には書き込んだ予定のキーを持たせ、次回「A〜D列が直されたか」の判定と重複防止に使う
+    markAutoRows(sheet, startRow, rows.map(r => rowKey(r[C.NO], r[C.NAME], r[C.TIME])));
     // 長い文字は折り返さず切り詰め、行の高さを強制的に統一（患者ごとに高さが変わらないように）
     try {
       range.setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
@@ -494,6 +508,7 @@ function runSync(targetDate, showPopup) {
     `要確認: ${summary.review}件\n` +
     `エラー: ${summary.errors}件\n` +
     `重複スキップ: ${skipped}件\n` +
+    (kept > 0 ? `人が入力済みのため残した行: ${kept}件\n` : '') +
     `患者以外として除外: ${summary.excluded}件（内容は実行ログ）`);
   return summary;
 }
@@ -543,8 +558,13 @@ function pushUnique(rows, row, existingKeys) {
   return true;
 }
 
+// 予定のキー（番号|氏名|時刻）。シート上の表示（「0123」→「123」、「09:15」→「9:15」）と
+// 書き込み時の値が同じキーになるよう、番号の先頭0と時刻の表記ゆれをそろえる
 function rowKey(no, name, time) {
-  return String(no == null ? '' : no).trim() + '|' + normalizeStr(name) + '|' + String(time == null ? '' : time).trim();
+  const n = String(no == null ? '' : no).trim().replace(/^0+(?=\d)/, '');
+  const tm = String(time == null ? '' : time).match(/(\d{1,2}):(\d{2})/);
+  const t = tm ? `${Number(tm[1])}:${tm[2]}` : String(time == null ? '' : time).trim();
+  return n + '|' + normalizeStr(name) + '|' + t;
 }
 
 // 既存シートからキー集合を読む（A:時刻, C:番号, D:氏名）
@@ -552,7 +572,7 @@ function loadExistingKeys(sheet) {
   const set = new Set();
   const last = sheet.getLastRow();
   if (last < DATA_START_ROW) return set;
-  const vals = sheet.getRange(DATA_START_ROW, 1, last - DATA_START_ROW + 1, 4).getValues();
+  const vals = sheet.getRange(DATA_START_ROW, 1, last - DATA_START_ROW + 1, 4).getDisplayValues();
   vals.forEach(r => {
     const time = r[C.TIME], no = r[C.NO], name = r[C.NAME];
     if (name || no) set.add(rowKey(no, name, time));
@@ -564,16 +584,41 @@ function loadExistingKeys(sheet) {
 //   手入力行（目印なし）や合計・フッターは触らない。
 //   行ごと削除するため、前回挿入した行が積み重ならず、フッターは元位置に戻る。
 //   目印は「行メタデータ」（画面に出ない）。v10.0以前の「A列メモ」の目印も対象にする。
+//   次の自動生成行は「人が入力した行」として削除せず残し、その予定キーを返す（作り直さない）：
+//     ・人が入力する列（E列以降。旧形式の行はH列以降）に記入がある
+//     ・A〜D列が書き込み時から直されている（要確認行を補完した等）
+// @return { cleared: 削除行数, kept: 残した行数, keptKeys: Set<予定キー> }
 function clearAutoRows(sheet) {
+  const res  = { cleared: 0, kept: 0, keptKeys: new Set() };
   const last = sheet.getLastRow();
-  if (last < DATA_START_ROW) return 0;
-  const target = new Set(findAutoRows(sheet));
+  if (last < DATA_START_ROW) return res;
   const n = last - DATA_START_ROW + 1;
+  const marks = new Map(); // 行番号 → 目印の値（予定キー。旧形式は ''）
+  findAutoRows(sheet).forEach(m => marks.set(m.row, m.value));
   const notes = sheet.getRange(DATA_START_ROW, 1, n, 1).getNotes(); // 旧形式の目印（A列メモ）
   for (let i = 0; i < n; i++) {
-    if (notes[i][0] === AUTO_MARKER) target.add(DATA_START_ROW + i);
+    if (notes[i][0] === AUTO_MARKER && !marks.has(DATA_START_ROW + i)) marks.set(DATA_START_ROW + i, '');
   }
-  const targetRows = Array.from(target).filter(r => r >= DATA_START_ROW).sort((a, b) => a - b);
+  const disp = sheet.getRange(DATA_START_ROW, 1, n, TOTAL_COLS).getDisplayValues();
+
+  const targetRows = [];
+  Array.from(marks.keys()).filter(r => r >= DATA_START_ROW && r <= last).sort((a, b) => a - b).forEach(r => {
+    const v = disp[r - DATA_START_ROW];
+    const saved = marks.get(r);
+    // 旧形式（キーなし）の行はE〜G列も自動で入れていたため、H列以降だけで判定する
+    const manualFrom = saved ? AUTO_FILL_COLS : 7;
+    const hasManual  = v.slice(manualFrom, TOTAL_COLS).some(x => x !== '');
+    const curKey     = rowKey(v[C.NO], v[C.NAME], v[C.TIME]);
+    const editedAD   = !!saved && curKey !== saved;
+    if (hasManual || editedAD) {
+      res.kept++;
+      if (saved) res.keptKeys.add(saved);
+      res.keptKeys.add(curKey);
+    } else {
+      targetRows.push(r);
+    }
+  });
+
   // 予定行が全部消えると合計式の範囲がなくなり #REF! になるため、
   // 予定行が1行も残らない場合は先頭の1行だけ「中身を消して残す」（書式・罫線はそのまま）
   const footer = findFooterRow(sheet);
@@ -593,7 +638,26 @@ function clearAutoRows(sheet) {
       sheet.deleteRow(r);
     }
   }
-  return targetRows.length;
+  res.cleared = targetRows.length;
+  return res;
+}
+
+// 自動生成行に目印（行メタデータ）を付ける。値には書き込んだ予定のキーを入れる
+//   行メタデータは行の挿入・削除・並べ替えにも追従する
+function markAutoRows(sheet, startRow, keys) {
+  keys.forEach((key, i) => {
+    const r = startRow + i;
+    withRetry(() => sheet.getRange(`${r}:${r}`).addDeveloperMetadata(AUTO_META_KEY, key || ''), 'addDeveloperMetadata');
+  });
+}
+
+// 目印（行メタデータ）が付いた行の一覧 [{row, value}]
+function findAutoRows(sheet) {
+  return sheet.createDeveloperMetadataFinder()
+    .withKey(AUTO_META_KEY)
+    .withLocationType(SpreadsheetApp.DeveloperMetadataLocationType.ROW)
+    .find()
+    .map(md => ({ row: md.getLocation().getRow().getRow(), value: md.getValue() || '' }));
 }
 
 // 最後の予定行と「合計」行の間の空行を削除し、合計行を最後の予定行のすぐ下に詰める
@@ -629,22 +693,6 @@ function fixFooterSums(sheet) {
   });
 }
 
-// 自動生成行に目印（行メタデータ）を付ける。行の挿入・削除・並べ替えにも追従する
-function markAutoRows(sheet, startRow, count) {
-  for (let r = startRow; r < startRow + count; r++) {
-    withRetry(() => sheet.getRange(`${r}:${r}`).addDeveloperMetadata(AUTO_META_KEY), 'addDeveloperMetadata');
-  }
-}
-
-// 目印（行メタデータ）が付いた行番号の一覧
-function findAutoRows(sheet) {
-  return sheet.createDeveloperMetadataFinder()
-    .withKey(AUTO_META_KEY)
-    .withLocationType(SpreadsheetApp.DeveloperMetadataLocationType.ROW)
-    .find()
-    .map(md => md.getLocation().getRow().getRow());
-}
-
 // 【移行用・メニュー】全日付タブのA列に残っている旧形式の目印メモ（黒い印）を消し、
 //   行メタデータの目印に置き換える（その日を再実行しても上書き対象として認識される）
 //   タブが多い場合は6分制限に備えて時間で区切る。未完なら再実行すると続きから処理する
@@ -662,7 +710,7 @@ function migrateMarkerNotes() {
     let hit = 0;
     const cleaned = notes.map((r, i) => {
       if (r[0] !== AUTO_MARKER) return [r[0]];
-      markAutoRows(sh, DATA_START_ROW + i, 1);
+      markAutoRows(sh, DATA_START_ROW + i, ['']); // 旧形式の行（予定キーなし）
       hit++;
       return [''];
     });
