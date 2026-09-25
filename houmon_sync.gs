@@ -10,7 +10,9 @@
 //      書き込んだ行は折り返さず（はみ出しは切り詰め）、行の高さを強制的に揃える
 //   2. 「PCM」等の患者ではない予定を転記しない
 //      ・NON_PATIENT_KEYWORDS に PCM を追加し、大文字/小文字・全角/半角を区別せず判定
-//      ・患者を特定できず、日本語(漢字/かな)も3桁以上の番号も含まない予定は患者ではないとみなす
+//      ・患者を特定できなかった予定は、業務用語(NON_NAME_WORDS)・時刻・記号を除いた残りに
+//        人の名前らしい並び（漢字2文字以上／漢字1文字＋かな2文字以上）が無ければ除外
+//        （施設名を含む予定・3桁以上の番号を含む予定は除外しない）。除外件数は完了ポップアップに表示
 //   3. A列右上の黒い印（自動生成行の目印メモ）を廃止し、見えない「行メタデータ」に変更
 //      既存タブに残っている目印メモは、実行時に自動でメタデータへ置き換える
 //      （全日付タブを一括で消す場合はメニュー「目印メモの一括削除」）
@@ -118,7 +120,32 @@ const NON_PATIENT_KEYWORDS = [
   'PCM',
 ];
 // ※判定は大文字/小文字・全角/半角を区別しない（'pcm' 'ＰＣＭ' も除外）。
-//   患者ではない予定が転記されたら、ここに単語を追加する。
+//   ここの単語を含む予定は、患者名が入っていても除外される（強い除外）。
+
+// 人の名前ではない単語（弱い除外）
+//   患者を特定できなかった予定について、これらの単語・時刻・記号を取り除き、
+//   残りに「人の名前らしい並び」（漢字2文字以上／漢字1文字＋かな2文字以上）が無ければ除外する。
+//   名前が残る予定（例:「車両点検 山田」）は要確認として残るので、新患を誤って消さない。
+//   ※1文字の単語は名字を削ってしまうため登録しない
+const NON_NAME_WORDS = [
+  // 車両・業者・来客
+  '訪問車', '往診車', '車両', '点検', '車検', '洗車', '給油', '納品', '業者', '来客', '来訪',
+  '面談', '面接', '見学', '説明会', '契約', '支払い', '支払', '銀行', '税理士', '社労士',
+  // 事務・院内作業
+  '事務', '書類', '請求', 'レセプト', 'レセ', '算定', '会計', '集金', '報告書', '計画書',
+  '同意書', '契約書', '提出', '役所', '市役所', '保健所', '片付け', '掃除', '清掃', '消毒',
+  '滅菌', '発注', '在庫', '棚卸', '技工', '送迎', '配達', '郵便', '書類作成',
+  // 予定枠・連絡
+  '予約', '空き', '空枠', 'キャンセル', '未定', '調整', '保留', '連絡', '電話', '確認',
+  'TEL', 'メール', 'メモ', 'テスト', 'TODO', 'test', 'OFF',
+  // 休み・時間帯
+  '昼休み', '休憩', '昼食', 'ランチ', '有給', '有休', '代休', '半休', '午前休', '午後休',
+  '欠勤', '早退', '遅刻', '帰院', '出発', '戻り', '午前', '午後', 'AM', 'PM',
+  // 行事・会議
+  '誕生日', '飲み会', '忘年会', '新年会', '歓迎会', '送別会', '懇親会', '講習', 'セミナー',
+  '講演', '委員会', '担当者会議', 'カンファレンス', 'カンファ', '朝礼', '終礼', '申し送り',
+  '往診', '訪問', '口腔ケア', 'ケア',
+];
 
 // 治療内容の記録ドキュメント抽出見出し（フェーズ2でtext抽出する際に使用）
 const CONTENT_HEADINGS = ['前回業務内容', '業務内容', '治療内容', '処置内容'];
@@ -238,7 +265,7 @@ function 転記テスト_7月6日() {
 // @param showPopup  完了ポップアップを出すか（メニュー実行時true）
 // ============================================================
 function runSync(targetDate, showPopup) {
-  const summary = { written: 0, review: 0, errors: 0, targetDate: fmtDate(targetDate) };
+  const summary = { written: 0, review: 0, errors: 0, excluded: 0, targetDate: fmtDate(targetDate) };
   Logger.log(`=== 訪問予定転記処理 開始（対象日: ${summary.targetDate}） ===`);
 
   const startTime = new Date(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate(), 0, 0, 0);
@@ -306,6 +333,7 @@ function runSync(targetDate, showPopup) {
       // （例:「PCM」）は患者の予定ではないとみなして転記しない
       if (!facility && looksNonPatient(ev.title)) {
         Logger.log(`患者ではない予定として除外: "${ev.title}"`);
+        summary.excluded++;
         continue;
       }
       // F2/F4: 患者を特定できない → 要確認行
@@ -402,7 +430,8 @@ function runSync(targetDate, showPopup) {
     `転記: ${summary.written}件\n` +
     `要確認: ${summary.review}件\n` +
     `エラー: ${summary.errors}件\n` +
-    `重複スキップ: ${skipped}件`);
+    `重複スキップ: ${skipped}件\n` +
+    `患者以外として除外: ${summary.excluded}件（内容は実行ログ）`);
   return summary;
 }
 
@@ -1057,13 +1086,28 @@ function isNonPatientTitle(title) {
   return NON_PATIENT_KEYWORDS.some(kw => t.indexOf(toHalfWidth(kw).toLowerCase()) !== -1);
 }
 
-// 日本語（漢字/ひらがな/カタカナ）も3桁以上の番号も含まない（例:「PCM」「Dr. Visit」）
-//   → 氏名・カルテ番号になり得ないため、患者の予定ではないとみなす
+// 人の名前らしい並びが無い予定を「患者ではない」とみなす（患者を特定できなかった予定のみに使う）
+//   1) 3桁以上の番号（カルテ番号の可能性）があれば患者扱い（除外しない）
+//   2) 時刻・NON_NAME_WORDS・記号・短い数字を取り除く
+//   3) 残りに「漢字2文字以上」または「漢字1文字＋かな2文字以上」（例: 林たけ）が無ければ除外
+//   例: PCM / カンファレンス / 車両点検 / 昼休み 12:00 / 担当者会議 → 除外
+//       車両点検 山田 / 林たけ / 7630 → 残す（要確認）
 function looksNonPatient(title) {
-  const t = toHalfWidth(title);
-  const hasJapanese = /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff々]/.test(t);
-  const hasNumber   = /\d{3,}/.test(t);
-  return !hasJapanese && !hasNumber;
+  let t = toHalfWidth(title);
+  if (/\d{3,}/.test(t)) return false;
+  t = t.replace(/\d{1,2}[:：]\d{2}\s*(頃|ごろ|前後|くらい|~|〜|-)?/g, ' ');
+  NON_NAME_WORDS
+    .map(w => toHalfWidth(w))
+    .sort((a, b) => b.length - a.length) // 長い単語から消す（「担当者会議」を「会議」より先に）
+    .forEach(w => {
+      t = /^[A-Za-z]+$/.test(w)
+        ? t.replace(new RegExp(`(^|[^A-Za-z])${w}(?![A-Za-z])`, 'gi'), '$1 ')
+        : t.split(w).join(' ');
+    });
+  const KANJI = '\u3400-\u9fff\uf900-\ufaff々';
+  const KANA  = '\u3040-\u30ff';
+  const nameLike = new RegExp(`[${KANJI}]{2,}|[${KANJI}][${KANA}]{2,}`);
+  return !nameLike.test(t);
 }
 
 
