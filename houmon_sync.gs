@@ -1,8 +1,19 @@
 // ============================================================
 // 訪問歯科 カレンダー → スプレッドシート 自動転記スクリプト
-// バージョン: 10.0.0（要件定義書 v0.2 フェーズ1対応）
+// バージョン: 10.2.0（要件定義書 v0.2 フェーズ1対応）
 // 実行アカウント: wadadc.houmon@gmail.com
-// 更新日: 2026-09-17
+// 更新日: 2026-09-25
+// ============================================================
+// 【v10.2.0 の変更点】（本日分の試行結果を受けた修正）
+//   1. E列(治療内容)を「ケア」「義歯」等の短い単語で表示（単語をクリックで記録ドキュメントが開く）
+//      CONTENT_MODE='label'。単語の辞書は CONTENT_LABEL_RULES で調整する
+//      書き込んだ行は折り返さず（はみ出しは切り詰め）、行の高さを強制的に揃える
+//   2. 「PCM」等の患者ではない予定を転記しない
+//      ・NON_PATIENT_KEYWORDS に PCM を追加し、大文字/小文字・全角/半角を区別せず判定
+//      ・患者を特定できず、日本語(漢字/かな)も3桁以上の番号も含まない予定は患者ではないとみなす
+//   3. A列右上の黒い印（自動生成行の目印メモ）を廃止し、見えない「行メタデータ」に変更
+//      既存タブに残っている目印メモは、実行時に自動でメタデータへ置き換える
+//      （全日付タブを一括で消す場合はメニュー「目印メモの一括削除」）
 // ============================================================
 // 【v10.0.0 の変更点】
 //   1. 施設フォルダを18件追加（鳴門病院・兼松病院ほか）＝ 計22ルート
@@ -103,19 +114,40 @@ const HOME_KEYWORDS = ['在宅', '居宅'];
 const NON_PATIENT_KEYWORDS = [
   '会議', 'ミーティング', '研修', '休み', '祝日', '休診',
   '院長', '副院長', 'mtg', 'MTG', '打ち合わせ', '勉強会',
-  '学会', '出張', '健診', '検診', '移動', '準備'
+  '学会', '出張', '健診', '検診', '移動', '準備',
+  'PCM',
 ];
+// ※判定は大文字/小文字・全角/半角を区別しない（'pcm' 'ＰＣＭ' も除外）。
+//   患者ではない予定が転記されたら、ここに単語を追加する。
 
 // 治療内容の記録ドキュメント抽出見出し（フェーズ2でtext抽出する際に使用）
 const CONTENT_HEADINGS = ['前回業務内容', '業務内容', '治療内容', '処置内容'];
 
 // ▼ 動作モード
-const CONTENT_MODE = 'link';      // 'link'=フェーズ1(URLをリンク挿入) / 'text'=フェーズ2(中身抽出)
+// 'label' = 記録ドキュメントの中身から短い単語（ケア/義歯 等）を作り、その単語をリンクにする（推奨）
+// 'link'  = 「前回記録を開く」の固定文字でリンク挿入
+// 'text'  = 中身の文章をそのまま転記（長くなるため非推奨）
+const CONTENT_MODE = 'label';
 const LINK_LABEL   = '前回記録を開く';
+// E列に出す単語の辞書（上から順に判定し、当てはまったものを最大 CONTENT_LABEL_MAX 個「・」でつなぐ）
+//   words の英字は前後が英字でないときだけ一致（'PD' が 'PDF' に当たらない）
+//   現場の言い方に合わせて自由に追加・変更してよい
+const CONTENT_LABEL_RULES = [
+  { label: '義歯', words: ['義歯', '入れ歯', 'デンチャー', 'リベース', '床裏装', '増歯', '人工歯', 'FD', 'PD'] },
+  { label: '抜歯', words: ['抜歯', 'EXT'] },
+  { label: '根治', words: ['根管', '根治', '抜髄', '感根', '根充', 'RCT'] },
+  { label: '充填', words: ['充填', '充塡', 'CR'] },
+  { label: '印象', words: ['印象', '型取り'] },
+  { label: 'SRP',  words: ['SRP'] },
+  { label: 'ケア', words: ['ケア', '口腔衛生', '清掃', 'PMTC', 'ブラッシング', 'TBI', 'スケーリング', '歯石', 'SC'] },
+];
+const CONTENT_LABEL_MAX      = 2;  // 1セルに出す単語の最大数（例: 義歯・ケア）
+const CONTENT_FALLBACK_CHARS = 6;  // 辞書に当てはまらないとき、記録の先頭何文字を出すか
 // 'overwrite'   = 前回の自動生成行を消してから入れ直す（毎回きれいに再生成・推奨）
 // 'append_dedup'= 既存と重複しない行だけ追記
 const WRITE_MODE   = 'overwrite';
-const AUTO_MARKER  = '__訪問予定表_自動生成__'; // 自動生成行の目印（A列メモ・非表示/非印刷）
+const AUTO_META_KEY = 'houmon_auto';            // 自動生成行の目印（行メタデータのキー・画面には出ない）
+const AUTO_MARKER   = '__訪問予定表_自動生成__'; // v10.0以前の目印（A列メモ）。移行・削除のためだけに使用
 const USE_CACHE    = true;        // 患者マスタをキャッシュ
 const MAX_RETRY    = 3;           // API一時エラー時のリトライ回数
 // A〜Gのみ自動記入し、H〜T（O/P/Q含む）は手動運用とする。
@@ -165,6 +197,8 @@ function onOpen() {
     .addItem('レイアウト正規化（行高さ）', 'normalizeLayout')
     .addItem('レイアウト正規化 進捗リセット', 'resetLayoutProgress')
     .addItem('行高さの現状サンプル確認', 'diagnoseRowHeights')
+    .addSeparator()
+    .addItem('目印メモの一括削除（A列の黒い印）', 'migrateMarkerNotes')
     .addToUi();
 }
 
@@ -267,8 +301,14 @@ function runSync(targetDate, showPopup) {
     const patients = extractPatientsFromTitle(ev.title, master);
 
     if (patients.length === 0) {
-      // F2/F4: 患者を特定できない → 要確認行
       const facility = detectFacility(ev.title, master);
+      // 患者を特定できず、施設名・日本語（漢字/かな）・3桁以上の番号のどれも無い予定
+      // （例:「PCM」）は患者の予定ではないとみなして転記しない
+      if (!facility && looksNonPatient(ev.title)) {
+        Logger.log(`患者ではない予定として除外: "${ev.title}"`);
+        continue;
+      }
+      // F2/F4: 患者を特定できない → 要確認行
       const row = buildRow({
         ev, facilityName: facility, home: facility ? isHome(facility) : false,
         patientNo: '要確認', patientName: ev.title, contentCell: '',
@@ -295,10 +335,14 @@ function runSync(targetDate, showPopup) {
       let contentCell = '';
       let biko        = '';
       try {
-        if (CONTENT_MODE === 'link') {
+        if (CONTENT_MODE === 'label' || CONTENT_MODE === 'link') {
           const doc = getLatestDoc(p.folderId);
           if (doc) {
-            contentCell = `=HYPERLINK("${doc.url}","${LINK_LABEL}")`;
+            let label = LINK_LABEL;
+            if (CONTENT_MODE === 'label') {
+              label = makeContentLabel(extractBusinessContent(doc.id)) || LINK_LABEL;
+            }
+            contentCell = `=HYPERLINK("${doc.url}","${label.replace(/"/g, '""')}")`;
           } else {
             biko = '記録ファイル未検出';
           }
@@ -335,13 +379,15 @@ function runSync(targetDate, showPopup) {
     const startRow = getWriteStart(sheet, footer);    // フッター手前の最初の空き行
     Logger.log(`レイアウト: フッター行=${footer || '未検出'} / 書込開始=${startRow} / 必要行数=${rows.length}`);
     ensureRoom(sheet, startRow, rows.length, footer); // 不足分の行を確保
-    withRetry(() => sheet.getRange(startRow, 1, rows.length, TOTAL_COLS).setValues(rows), 'setValues');
-    // 自動生成行の目印（A列に見えないメモ）を付与 → 次回の上書き対象になる
-    const notes = rows.map(() => [AUTO_MARKER]);
-    withRetry(() => sheet.getRange(startRow, 1, rows.length, 1).setNotes(notes), 'setNotes');
-    // 追加した行の高さを統一（行高さが揃わない不具合の予防）
-    try { sheet.setRowHeights(startRow, rows.length, ROW_HEIGHT_DATA); }
-    catch (e) { Logger.log(`行高さ設定警告: ${e.message}`); }
+    const range = sheet.getRange(startRow, 1, rows.length, TOTAL_COLS);
+    withRetry(() => range.setValues(rows), 'setValues');
+    // 自動生成行の目印（画面に出ない行メタデータ）を付与 → 次回の上書き対象になる
+    markAutoRows(sheet, startRow, rows.length);
+    // 長い文字は折り返さず切り詰め、行の高さを強制的に統一（患者ごとに高さが変わらないように）
+    try {
+      range.setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
+      sheet.setRowHeightsForced(startRow, rows.length, ROW_HEIGHT_DATA);
+    } catch (e) { Logger.log(`行高さ設定警告: ${e.message}`); }
     Logger.log(`書き込み: ${startRow}行目から ${rows.length}件（重複スキップ ${skipped}件）`);
   } else {
     Logger.log(`書き込み対象なし（重複スキップ ${skipped}件）`);
@@ -422,21 +468,67 @@ function loadExistingKeys(sheet) {
   return set;
 }
 
-// overwrite用：システムが前回入れた行（A列マーカー付き）だけを削除する
-//   手入力行（マーカーなし）や合計・フッターは触らない。
+// overwrite用：システムが前回入れた行（目印付き）だけを削除する
+//   手入力行（目印なし）や合計・フッターは触らない。
 //   行ごと削除するため、前回挿入した行が積み重ならず、フッターは元位置に戻る。
+//   目印は「行メタデータ」（画面に出ない）。v10.0以前の「A列メモ」の目印も対象にする。
 function clearAutoRows(sheet) {
   const last = sheet.getLastRow();
   if (last < DATA_START_ROW) return 0;
+  const target = new Set(findAutoRows(sheet));
   const n = last - DATA_START_ROW + 1;
-  const notes = sheet.getRange(DATA_START_ROW, 1, n, 1).getNotes(); // A列のメモ
-  const targetRows = [];
+  const notes = sheet.getRange(DATA_START_ROW, 1, n, 1).getNotes(); // 旧形式の目印（A列メモ）
   for (let i = 0; i < n; i++) {
-    if (notes[i][0] === AUTO_MARKER) targetRows.push(DATA_START_ROW + i);
+    if (notes[i][0] === AUTO_MARKER) target.add(DATA_START_ROW + i);
   }
-  // 下から削除（行番号のズレを防ぐ／数式範囲は自動調整）
+  const targetRows = Array.from(target).filter(r => r >= DATA_START_ROW).sort((a, b) => a - b);
+  // 下から削除（行番号のズレを防ぐ／数式範囲は自動調整）。行メタデータも行と一緒に消える
   for (let i = targetRows.length - 1; i >= 0; i--) sheet.deleteRow(targetRows[i]);
   return targetRows.length;
+}
+
+// 自動生成行に目印（行メタデータ）を付ける。行の挿入・削除・並べ替えにも追従する
+function markAutoRows(sheet, startRow, count) {
+  for (let r = startRow; r < startRow + count; r++) {
+    withRetry(() => sheet.getRange(`${r}:${r}`).addDeveloperMetadata(AUTO_META_KEY), 'addDeveloperMetadata');
+  }
+}
+
+// 目印（行メタデータ）が付いた行番号の一覧
+function findAutoRows(sheet) {
+  return sheet.createDeveloperMetadataFinder()
+    .withKey(AUTO_META_KEY)
+    .withLocationType(SpreadsheetApp.DeveloperMetadataLocationType.ROW)
+    .find()
+    .map(md => md.getLocation().getRow().getRow());
+}
+
+// 【移行用・メニュー】全日付タブのA列に残っている旧形式の目印メモ（黒い印）を消し、
+//   行メタデータの目印に置き換える（その日を再実行しても上書き対象として認識される）
+//   タブが多い場合は6分制限に備えて時間で区切る。未完なら再実行すると続きから処理する
+function migrateMarkerNotes() {
+  const t0 = Date.now();
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheets = ss.getSheets().filter(sh => DAY_TAB_RE.test(sh.getName()));
+  let tabs = 0, rowsFixed = 0, finished = true;
+  for (const sh of sheets) {
+    if (Date.now() - t0 > LAYOUT_TIME_BUDGET_MS) { finished = false; break; }
+    const last = sh.getLastRow();
+    if (last < DATA_START_ROW) continue;
+    const range = sh.getRange(DATA_START_ROW, 1, last - DATA_START_ROW + 1, 1);
+    const notes = range.getNotes();
+    let hit = 0;
+    const cleaned = notes.map((r, i) => {
+      if (r[0] !== AUTO_MARKER) return [r[0]];
+      markAutoRows(sh, DATA_START_ROW + i, 1);
+      hit++;
+      return [''];
+    });
+    if (hit > 0) { range.setNotes(cleaned); tabs++; rowsFixed += hit; }
+  }
+  Logger.log(`目印メモの置き換え: ${tabs}タブ / ${rowsFixed}行 / ${finished ? '完了' : '未完（再実行してください）'}`);
+  finishPopup(true, `目印メモ（A列の黒い印）を削除しました。\n${tabs}タブ / ${rowsFixed}行` +
+    (finished ? '' : '\nまだ残りがあります。もう一度実行してください。'));
 }
 
 // フッター開始位置（「合計」行 or AM/PM集計行）を探す。無ければ0
@@ -866,7 +958,7 @@ function collectAllEvents(startTime, endTime) {
         if (event.isAllDayEvent()) continue;              // F1: 終日予定は除外
         const title = event.getTitle().trim();
         if (!title) continue;                              // F1: タイトル未記入は除外
-        if (NON_PATIENT_KEYWORDS.some(kw => title.includes(kw))) continue;
+        if (isNonPatientTitle(title)) continue;
 
         collected.push({
           title    : title,
@@ -898,27 +990,24 @@ function getLatestDoc(folderId) {
       const t = f.getLastUpdated().getTime();
       if (t > latestT) { latestT = t; latest = f; }
     }
-    return latest ? { url: latest.getUrl(), name: latest.getName() } : null;
+    return latest ? { id: latest.getId(), url: latest.getUrl(), name: latest.getName() } : null;
   }, 'getLatestDoc');
 }
 
 
 // ============================================================
-// 【フェーズ2用】最新カルテから治療内容の本文を抽出
-//   CONTENT_MODE='text' のときのみ使用
+// 最新カルテから治療内容の本文を抽出
+//   CONTENT_MODE='text'（本文をそのまま転記）と 'label'（短い単語に変換）で使用
 // ============================================================
 function getLastBusinessContent(folderId) {
-  const folder = DriveApp.getFolderById(folderId);
-  const files = folder.getFilesByType(MimeType.GOOGLE_DOCS);
-  let latestFile = null, latestDate = 0;
-  while (files.hasNext()) {
-    const file = files.next();
-    const t = file.getLastUpdated().getTime();
-    if (t > latestDate) { latestDate = t; latestFile = file; }
-  }
-  if (!latestFile) return null;
+  const doc = getLatestDoc(folderId);
+  if (!doc) return null;
+  return extractBusinessContent(doc.id);
+}
 
-  const paragraphs = DocumentApp.openById(latestFile.getId()).getBody().getParagraphs();
+// ドキュメント本文から「前回業務内容」等の見出し直後の段落を取り出す（見つからなければ ''）
+function extractBusinessContent(docId) {
+  const paragraphs = withRetry(() => DocumentApp.openById(docId).getBody().getParagraphs(), 'openDoc');
   let capturing = false;
   const lines = [];
   for (const para of paragraphs) {
@@ -931,6 +1020,50 @@ function getLastBusinessContent(folderId) {
     if (!capturing && CONTENT_HEADINGS.some(kw => text.includes(kw))) capturing = true;
   }
   return lines.join('\n');
+}
+
+// 治療内容の文章 → E列に出す短い単語（例:「義歯」「義歯・ケア」）
+//   CONTENT_LABEL_RULES に当てはまる単語を上から最大 CONTENT_LABEL_MAX 個。
+//   どれにも当てはまらなければ、記録の1行目の先頭 CONTENT_FALLBACK_CHARS 文字。空なら ''
+function makeContentLabel(text) {
+  const src = toHalfWidth(text || '');
+  if (!src.trim()) return '';
+  const labels = [];
+  for (const rule of CONTENT_LABEL_RULES) {
+    if (labels.length >= CONTENT_LABEL_MAX) break;
+    if (rule.words.some(w => containsWord(src, w))) labels.push(rule.label);
+  }
+  if (labels.length > 0) return labels.join('・');
+  const first = src.split('\n')[0].trim();
+  return first.length > CONTENT_FALLBACK_CHARS ? first.slice(0, CONTENT_FALLBACK_CHARS) + '…' : first;
+}
+
+// 単語を含むか。英数字だけの単語は、前後が英字でないときだけ一致（大文字小文字は区別しない）
+function containsWord(src, word) {
+  const w = toHalfWidth(word);
+  if (/^[A-Za-z0-9]+$/.test(w)) {
+    return new RegExp(`(^|[^A-Za-z])${w}(?![A-Za-z])`, 'i').test(src);
+  }
+  return src.indexOf(w) !== -1;
+}
+
+
+// ============================================================
+// 患者ではない予定の判定
+// ============================================================
+// NON_PATIENT_KEYWORDS を含むか（大文字/小文字・全角/半角を区別しない）
+function isNonPatientTitle(title) {
+  const t = toHalfWidth(title).toLowerCase();
+  return NON_PATIENT_KEYWORDS.some(kw => t.indexOf(toHalfWidth(kw).toLowerCase()) !== -1);
+}
+
+// 日本語（漢字/ひらがな/カタカナ）も3桁以上の番号も含まない（例:「PCM」「Dr. Visit」）
+//   → 氏名・カルテ番号になり得ないため、患者の予定ではないとみなす
+function looksNonPatient(title) {
+  const t = toHalfWidth(title);
+  const hasJapanese = /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff々]/.test(t);
+  const hasNumber   = /\d{3,}/.test(t);
+  return !hasJapanese && !hasNumber;
 }
 
 
