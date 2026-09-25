@@ -16,6 +16,12 @@
 //   3. A列右上の黒い印（自動生成行の目印メモ）を廃止し、見えない「行メタデータ」に変更
 //      既存タブに残っている目印メモは、実行時に自動でメタデータへ置き換える
 //      （全日付タブを一括で消す場合はメニュー「目印メモの一括削除」）
+//   4. 日付タブ・月まとめタブの自動作成（既存タブを見本に複製し、日付・曜日・合計式を書き換え）
+//      ・転記時に対象日のタブが無ければ、その月のタブ（まとめ＋月〜土）を自動作成
+//      ・メニュー「日付タブを先まで作成」で TABS_AHEAD_MONTHS か月先まで一括作成
+//   5. 施設フォルダ・ペアカレンダーをスプレッドシートの「設定_施設」「設定_カレンダー」タブで管理
+//      （スタッフがGASを触らずに追加・停止できる。設定タブが無い間はコード内の定数を使用）
+//   6. 自動記入行の高さを既存タブと同じ 34px に変更（従来 21px で既存行と高さが違っていた）
 // ============================================================
 // 【v10.0.0 の変更点】
 //   1. 施設フォルダを18件追加（鳴門病院・兼松病院ほか）＝ 計22ルート
@@ -65,6 +71,8 @@ const SPREADSHEET_ID = '1csP0kizK-JWU_j-ZeIl7EJ9_zvEthNtzZ0x4uxE8ODE';
 //
 //  施設を増やすときは、この配列に1行追記するだけ。
 // ------------------------------------------------------------
+// ※v10.2 以降は「設定_施設」タブがあればそちらを使う（この配列は初期値・予備）。
+//   メニュー「設定タブを作成（初回のみ）」でこの内容が設定タブに書き出される。
 const ROOT_FOLDER_IDS = [
   // ---- 既存（v9.0.0から変更なし・自動判別） ----
   '1Ob3Q_nFxMfS3Wisu6DtvuClqgypy5OFX', // 【藍寿苑】
@@ -100,6 +108,7 @@ const MAX_SCAN_DEPTH = 3;
 // B列に病棟名まで出す場合は true（例:「東病院 西4病棟」）
 const WARD_IN_FACILITY = false;
 
+// ※v10.2 以降は「設定_カレンダー」タブがあればそちらを使う（この配列は初期値・予備）
 const PAIR_CALENDARS = [
   { id: 'bin6k5jtja113pgodt0pnmk9kk@group.calendar.google.com', dr: '斎藤DR',  dh: 'DH寒川'  },
   { id: 'h7a37hsovvm4ip2th4cj25i2i4@group.calendar.google.com', dr: '木下DR',  dh: 'DH坂野'  },
@@ -196,7 +205,18 @@ const C = {
 };
 
 // ▼ レイアウト正規化（行高さ／列幅）
-const ROW_HEIGHT_DATA   = 21;      // 予定行の標準高さ(px)
+const ROW_HEIGHT_DATA   = 34;      // 予定行の標準高さ(px)。既存の日付タブの予定行(25.5pt=34px)に合わせる
+
+// ▼ 日付タブ・月まとめタブの自動作成
+const TABS_AHEAD_MONTHS  = 3;      // メニュー／自動実行で「今月から何か月先まで」タブを用意するか
+const CREATE_SUNDAY_TABS = false;  // 日曜のタブも作るか（既存は日曜なし。日曜に予定がある日だけは転記時に作成）
+const TEMPLATE_FOOTER_ROW = 23;    // 見本にする日付タブの「合計」行（標準形＝予定行3〜22）
+const SUMMARY_SAT_BG = '#e6f0ff';  // 月まとめ：土曜行の背景（見本タブから読めない場合の予備）
+const SUMMARY_SUN_BG = '#ffe6e6';  // 月まとめ：日曜行の背景（同上）
+
+// ▼ 設定タブ（スタッフが施設・カレンダーを追加するためのタブ）
+const SETTINGS_FACILITY_SHEET = '設定_施設';
+const SETTINGS_CALENDAR_SHEET = '設定_カレンダー';
 const NORMALIZE_COL_WIDTH = false; // 列幅もテンプレタブに揃える場合 true（実行時間が延びます）
 const COL_WIDTH_TEMPLATE  = '';    // 列幅の見本タブ名（空なら最初に見つかった日付タブ）
 const LAYOUT_TIME_BUDGET_MS = 4.5 * 60 * 1000; // 1回の実行で使う時間上限（GAS制限6分）
@@ -220,6 +240,12 @@ function onOpen() {
     .addItem('患者マスタ診断', 'diagnosePatientFolders')
     .addItem('患者マスタ 事前構築', 'prebuildPatientMaster')
     .addItem('患者マスタ キャッシュ削除', 'clearMasterCache')
+    .addSeparator()
+    .addItem('設定タブを作成（初回のみ）', 'createSettingsSheets')
+    .addItem('設定の確認（施設フォルダ・カレンダー）', 'checkSettings')
+    .addItem('利用できるカレンダーの一覧', 'showCalendarList')
+    .addSeparator()
+    .addItem('日付タブを先まで作成', 'menuEnsureTabsAhead')
     .addSeparator()
     .addItem('レイアウト正規化（行高さ）', 'normalizeLayout')
     .addItem('レイアウト正規化 進捗リセット', 'resetLayoutProgress')
@@ -250,6 +276,8 @@ function menuUpdatePickDate() {
 // フェーズ1.5で毎朝トリガーに登録する対象
 // ============================================================
 function syncVisitSchedule() {
+  // 先のタブを用意（転記の時間を残すため2分で打ち切り、残りは翌日以降に続きを作る）
+  try { ensureTabsAhead(false, 2 * 60 * 1000); } catch (e) { Logger.log(`タブ自動作成エラー: ${e.message}`); }
   runSync(new Date(), false);
 }
 
@@ -285,7 +313,12 @@ function runSync(targetDate, showPopup) {
       sheet = ss.getSheetByName(name);
       if (sheet) { Logger.log(`書き込み先シート: 「${name}」`); break; }
     }
-    if (!sheet) throw new Error(`当日のシートが見つかりません。探した名前: ${candidates.map(n => `「${n}」`).join(' / ')}`);
+    if (!sheet) {
+      // タブが無い → その月のタブ（まとめ＋月〜土）を自動作成。日曜は予定がある場合だけ作る
+      sheet = ensureDayTab(ss, targetDate, allEvents.length > 0);
+      if (sheet) Logger.log(`日付タブを自動作成しました: 「${sheet.getName()}」`);
+    }
+    if (!sheet) throw new Error(`当日のシートが見つかりません（日曜で予定なし、または見本タブなし）。探した名前: ${candidates.map(n => `「${n}」`).join(' / ')}`);
   } catch (e) {
     Logger.log(`スプレッドシートエラー: ${e.message}`);
     finishPopup(showPopup, `エラー: ${e.message}`);
@@ -303,7 +336,7 @@ function runSync(targetDate, showPopup) {
   const master = buildPatientMaster(ss);
   Logger.log(`患者マスタ登録数: ${master.list.length}（施設${master.facilities.length}件）`);
   if (master.list.length === 0) {
-    Logger.log('【中断】患者マスタが空です。ROOT_FOLDER_IDS・アクセス権を確認してください。');
+    Logger.log('【中断】患者マスタが空です。「設定_施設」タブ（またはROOT_FOLDER_IDS）・アクセス権を確認してください。');
     summary.errors++;
     writeAccessLog(ss, summary);
     finishPopup(showPopup, '患者マスタが空です。フォルダのアクセス権を確認してください。');
@@ -765,7 +798,7 @@ function scanPatientMaster() {
   const master = { list: [], byNumber: new Map(), facilities: [], unmatched: [], failedRoots: [] };
   const facSet = new Set();
 
-  ROOT_FOLDER_IDS.forEach(entry => scanOneRoot(entry, master, facSet));
+  getRootEntries().forEach(entry => scanOneRoot(entry, master, facSet));
 
   master.facilities = Array.from(facSet);
   return master;
@@ -884,7 +917,7 @@ function addMasterRec(master, o) {
 // キャッシュキーに「日付」＋「ROOT_FOLDER_IDSのハッシュ」を含める。
 // → 施設フォルダを追加/変更すると自動的に別キーになり、キャッシュが作り直される
 function rootSignature() {
-  return ROOT_FOLDER_IDS
+  return getRootEntries()
     .map(e => (typeof e === 'string') ? e : `${e.id}:${e.name || ''}`)
     .join(',');
 }
@@ -975,7 +1008,7 @@ function clearMasterCache() {
 function collectAllEvents(startTime, endTime) {
   const collected = [];
 
-  for (const pair of PAIR_CALENDARS) {
+  for (const pair of getPairCalendars()) {
     try {
       const calendar = CalendarApp.getCalendarById(pair.id);
       if (!calendar) { Logger.log(`⚠ カレンダーが見つかりません: ${pair.dr}・${pair.dh}`); continue; }
@@ -1132,6 +1165,403 @@ function writeAccessLog(ss, summary) {
     Logger.log(`アクセスログ記録エラー: ${e.message}`);
   }
 }
+
+
+// ============================================================
+// 設定タブ（施設フォルダ・ペアカレンダー）
+//   スタッフがスプレッドシート上で施設・カレンダーを追加／停止できるようにする。
+//   設定タブが無い間は、コード内の ROOT_FOLDER_IDS / PAIR_CALENDARS を使う。
+//
+//   「設定_施設」     A:有効(✓) B:施設名 C:フォルダのURLまたはID D:メモ E:確認結果
+//     ・施設名は予定表のB列に出る名前。空欄なら従来の自動判別（フォルダ名から判断）
+//   「設定_カレンダー」A:有効(✓) B:担当DR C:担当DH D:カレンダーID E:メモ F:確認結果
+//   ※患者は施設フォルダの中の「番号_氏名」フォルダから自動で読み込むので、設定は不要
+// ============================================================
+let _rootEntriesMemo = null;
+let _pairCalendarsMemo = null;
+
+function getSettingsSheet(name) {
+  try { return SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(name); }
+  catch (e) { Logger.log(`設定タブ読込エラー(${name}): ${e.message}`); return null; }
+}
+
+// チェックボックスの ✓（または ○ / TRUE / 有効 / 1）なら有効
+function isEnabledCell(v) {
+  if (v === true) return true;
+  return /^(true|○|◯|✓|✔|有効|1)$/i.test(String(v == null ? '' : v).trim());
+}
+
+// フォルダのURL・IDのどちらを貼られてもIDを取り出す
+function extractDriveId(v) {
+  const s = String(v == null ? '' : v).trim();
+  const m = s.match(/\/folders\/([A-Za-z0-9_-]{10,})/) || s.match(/[?&]id=([A-Za-z0-9_-]{10,})/);
+  if (m) return m[1];
+  return /^[A-Za-z0-9_-]{10,}$/.test(s) ? s : '';
+}
+
+// 施設フォルダの一覧（設定_施設 タブ優先。タブが無ければ ROOT_FOLDER_IDS）
+function getRootEntries() {
+  if (_rootEntriesMemo) return _rootEntriesMemo;
+  const sh = getSettingsSheet(SETTINGS_FACILITY_SHEET);
+  if (!sh) return (_rootEntriesMemo = ROOT_FOLDER_IDS);
+  const list = [];
+  if (sh.getLastRow() >= 2) {
+    sh.getRange(2, 1, sh.getLastRow() - 1, 3).getValues().forEach(r => {
+      if (!isEnabledCell(r[0])) return;
+      const id = extractDriveId(r[2]);
+      if (!id) return;
+      const name = String(r[1] == null ? '' : r[1]).trim();
+      list.push(name ? { id, name } : id);
+    });
+  }
+  return (_rootEntriesMemo = list);
+}
+
+// ペアカレンダーの一覧（設定_カレンダー タブ優先。タブが無ければ PAIR_CALENDARS）
+function getPairCalendars() {
+  if (_pairCalendarsMemo) return _pairCalendarsMemo;
+  const sh = getSettingsSheet(SETTINGS_CALENDAR_SHEET);
+  if (!sh) return (_pairCalendarsMemo = PAIR_CALENDARS);
+  const list = [];
+  if (sh.getLastRow() >= 2) {
+    sh.getRange(2, 1, sh.getLastRow() - 1, 4).getValues().forEach(r => {
+      if (!isEnabledCell(r[0])) return;
+      const id = String(r[3] == null ? '' : r[3]).trim();
+      if (!id) return;
+      list.push({ id, dr: String(r[1] || '').trim(), dh: String(r[2] || '').trim() });
+    });
+  }
+  return (_pairCalendarsMemo = list);
+}
+
+// 【メニュー】設定タブを作成し、現在のコード内の設定を書き出す（既にあれば何もしない）
+function createSettingsSheets() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const made = [];
+  try {
+    if (!ss.getSheetByName(SETTINGS_FACILITY_SHEET)) {
+      const rows = ROOT_FOLDER_IDS.map(e => (typeof e === 'string')
+        ? [true, '', e, '施設名空欄＝フォルダ名から自動判別', '']
+        : [true, e.name || '', e.id, '', '']);
+      buildSettingsSheet(ss, SETTINGS_FACILITY_SHEET,
+        ['有効', '施設名（予定表B列）', 'フォルダのURLまたはID', 'メモ', '確認結果'],
+        [8, 22, 48, 30, 40], rows);
+      made.push(SETTINGS_FACILITY_SHEET);
+    }
+    if (!ss.getSheetByName(SETTINGS_CALENDAR_SHEET)) {
+      const rows = PAIR_CALENDARS.map(p => [true, p.dr, p.dh, p.id, '', '']);
+      buildSettingsSheet(ss, SETTINGS_CALENDAR_SHEET,
+        ['有効', '担当DR', '担当DH', 'カレンダーID', 'メモ', '確認結果'],
+        [8, 12, 12, 60, 24, 32], rows);
+      made.push(SETTINGS_CALENDAR_SHEET);
+    }
+  } catch (e) {
+    finishPopup(true, `設定タブを作成できませんでした: ${e.message}`);
+    return;
+  }
+  finishPopup(true, made.length
+    ? `作成しました: ${made.join(' / ')}\n\n` +
+      '・施設やカレンダーを増やすときは、最後の行の下に1行追加し「有効」に✓を付けてください。\n' +
+      '・使わなくなったものは行を消さず「有効」の✓を外すと停止できます。\n' +
+      '・追加したら、メニュー「設定の確認」で ✓ が出るか確認してください。'
+    : '設定タブは既にあります。');
+}
+
+function buildSettingsSheet(ss, name, headers, widthsChars, rows) {
+  const ROWS = 200;
+  const sh = ss.insertSheet(name, ss.getSheets().length);
+  // セル数上限対策：必要な大きさ（200行×見出し列数）に縮める
+  if (sh.getMaxRows() > ROWS) sh.deleteRows(ROWS + 1, sh.getMaxRows() - ROWS);
+  if (sh.getMaxColumns() > headers.length) sh.deleteColumns(headers.length + 1, sh.getMaxColumns() - headers.length);
+  sh.getRange(1, 1, 1, headers.length).setValues([headers])
+    .setFontWeight('bold').setBackground('#d9e1f2');
+  sh.setFrozenRows(1);
+  widthsChars.forEach((w, i) => sh.setColumnWidth(i + 1, w * 8));
+  sh.getRange(2, 1, ROWS - 1, 1).insertCheckboxes();
+  if (rows.length) sh.getRange(2, 1, rows.length, headers.length).setValues(rows);
+  return sh;
+}
+
+// 【メニュー】設定の確認：各行のフォルダ・カレンダーが開けるかを「確認結果」列に書き込む
+function checkSettings() {
+  _rootEntriesMemo = null; _pairCalendarsMemo = null;
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const msgs = [];
+
+  const fs = ss.getSheetByName(SETTINGS_FACILITY_SHEET);
+  if (fs && fs.getLastRow() >= 2) {
+    const vals = fs.getRange(2, 1, fs.getLastRow() - 1, 3).getValues();
+    let ok = 0, ng = 0;
+    const out = vals.map(r => {
+      if (!r[2]) return [''];
+      if (!isEnabledCell(r[0])) return ['（停止中）'];
+      const id = extractDriveId(r[2]);
+      if (!id) { ng++; return ['✗ URL/IDの形式が正しくありません']; }
+      try {
+        const f = DriveApp.getFolderById(id);
+        let n = 0; const it = f.getFolders(); while (it.hasNext()) { it.next(); n++; }
+        ok++;
+        return [`✓ 「${f.getName()}」 直下フォルダ${n}件`];
+      } catch (e) { ng++; return [`✗ 開けません（共有・IDを確認）`]; }
+    });
+    fs.getRange(2, 5, out.length, 1).setValues(out);
+    msgs.push(`施設フォルダ: OK ${ok}件 / NG ${ng}件`);
+  } else {
+    msgs.push(`「${SETTINGS_FACILITY_SHEET}」タブがありません（コード内の設定を使用中）`);
+  }
+
+  const cs = ss.getSheetByName(SETTINGS_CALENDAR_SHEET);
+  if (cs && cs.getLastRow() >= 2) {
+    const vals = cs.getRange(2, 1, cs.getLastRow() - 1, 4).getValues();
+    let ok = 0, ng = 0;
+    const out = vals.map(r => {
+      const id = String(r[3] || '').trim();
+      if (!id) return [''];
+      if (!isEnabledCell(r[0])) return ['（停止中）'];
+      try {
+        const cal = CalendarApp.getCalendarById(id);
+        if (!cal) { ng++; return ['✗ 見つかりません（共有・IDを確認）']; }
+        ok++;
+        return [`✓ 「${cal.getName()}」`];
+      } catch (e) { ng++; return ['✗ 開けません（共有・IDを確認）']; }
+    });
+    cs.getRange(2, 6, out.length, 1).setValues(out);
+    msgs.push(`カレンダー: OK ${ok}件 / NG ${ng}件`);
+  } else {
+    msgs.push(`「${SETTINGS_CALENDAR_SHEET}」タブがありません（コード内の設定を使用中）`);
+  }
+  finishPopup(true, msgs.join('\n') + '\n\n詳細は各設定タブの「確認結果」列を見てください。');
+}
+
+// 【メニュー】実行アカウントで見られるカレンダーの名前とIDを表示（設定_カレンダー への追加用）
+function showCalendarList() {
+  const lines = CalendarApp.getAllCalendars().map(c => `${c.getName()}\n  ${c.getId()}`);
+  Logger.log(lines.join('\n'));
+  finishPopup(true, lines.length
+    ? '「カレンダーID」を 設定_カレンダー のD列に貼り付けてください。\n\n' + lines.join('\n')
+    : '見られるカレンダーがありません。');
+}
+
+
+// ============================================================
+// 日付タブ・月まとめタブの自動作成
+//   既存タブを見本に「複製」して作るため、書式・列幅・合計式・印刷設定は既存と同じになる。
+//   ・日付タブ：最新の標準形タブ（合計行＝23行目）を複製 → 1行目の日付を書き換え、予定行を空にする
+//   ・月まとめ：最新の月まとめタブを複製 → タイトル・日付・曜日・行数・合計式・土日の色を書き換え
+//   ・並び順は既存と同じ（その月の まとめ → 1日 → 2日 …）
+//   ・作るのは月〜土（祝日も作る）。日曜は CREATE_SUNDAY_TABS=true の場合のみ
+// ============================================================
+// タブ名 → 並び順キー（まとめは日=0）。対象外のタブは null
+function sheetDateKey(name) {
+  const m = String(name).match(/^R(\d+)_(\d{1,2})月(?:(\d{1,2})日[(（].[)）]|まとめ)$/);
+  if (!m) return null;
+  return (Number(m[1]) + 2018) * 10000 + Number(m[2]) * 100 + (m[3] ? Number(m[3]) : 0);
+}
+
+function summarySheetName(y, m) { return `R${y - 2018}_${m}月まとめ`; }
+
+function findSheetByDate(ss, date) {
+  for (const name of buildDateSheetNames(date)) {
+    const sh = ss.getSheetByName(name);
+    if (sh) return sh;
+  }
+  return null;
+}
+
+// 見本の日付タブ（後ろから探して、合計行が標準位置にあるもの）
+function findTemplateDayTab(ss) {
+  const sheets = ss.getSheets();
+  let checked = 0;
+  for (let i = sheets.length - 1; i >= 0 && checked < 80; i--) {
+    const sh = sheets[i];
+    if (!DAY_TAB_RE.test(sh.getName())) continue;
+    checked++;
+    if (sh.getMaxRows() >= TEMPLATE_FOOTER_ROW &&
+        String(sh.getRange(TEMPLATE_FOOTER_ROW, 1).getValue()).replace(/\s|　/g, '') === '合計') return sh;
+  }
+  return null;
+}
+
+// 見本の月まとめタブ（一番後ろのもの）
+function findTemplateSummaryTab(ss) {
+  const sheets = ss.getSheets();
+  for (let i = sheets.length - 1; i >= 0; i--) {
+    if (/^R\d+_\d{1,2}月まとめ$/.test(sheets[i].getName())) return sheets[i];
+  }
+  return null;
+}
+
+// 見本タブを複製し、日付順の正しい位置に置く
+function copyTabInOrder(ss, template, name) {
+  const key = sheetDateKey(name);
+  const sheets = ss.getSheets();
+  let pos = sheets.length; // 挿入位置（0基点＝この数のタブの後ろ）
+  for (let i = sheets.length - 1; i >= 0; i--) {
+    const k = sheetDateKey(sheets[i].getName());
+    if (k !== null && k < key) { pos = i + 1; break; }
+    if (k !== null && k > key) pos = i;
+  }
+  const active = ss.getActiveSheet();
+  const sh = template.copyTo(ss).setName(name);
+  ss.setActiveSheet(sh);
+  ss.moveActiveSheet(pos + 1);
+  if (active) ss.setActiveSheet(active);
+  // 見本に付いていた自動生成行の目印（行メタデータ）は引き継がない
+  sh.createDeveloperMetadataFinder().withKey(AUTO_META_KEY).find().forEach(md => md.remove());
+  return sh;
+}
+
+// 日付タブを1枚作る
+function createDayTab(ss, date) {
+  const tpl = findTemplateDayTab(ss);
+  if (!tpl) { Logger.log('見本にできる日付タブ（合計行が23行目）が見つかりません'); return null; }
+  const name = buildDateSheetNames(date)[0];
+  const sh = copyTabInOrder(ss, tpl, name);
+
+  // 1行目：「令和10年　3月　31日　（金）　　DH：…」の日付部分だけ書き換える
+  const reiwa = date.getFullYear() - 2018;
+  const w = ['日', '月', '火', '水', '木', '金', '土'][date.getDay()];
+  const prefix = `令和${reiwa}年　${date.getMonth() + 1}月　${date.getDate()}日　（${w}）`;
+  const title = String(sh.getRange(1, 1).getValue());
+  const re = /^令和\d+年[\s　]*\d+月[\s　]*\d+日[\s　]*[（(].[）)]/;
+  sh.getRange(1, 1).setValue(re.test(title) ? title.replace(re, prefix) : prefix);
+
+  // 予定行（3行目〜合計行の1つ前）を空にする。見出し・合計行・AM/PM行はそのまま
+  const footer = findFooterRow(sh) || TEMPLATE_FOOTER_ROW;
+  if (footer > DATA_START_ROW) {
+    sh.getRange(DATA_START_ROW, 1, footer - DATA_START_ROW, TOTAL_COLS).clearContent().clearNote();
+  }
+  trimSheetGrid(sh, TOTAL_COLS);
+  return sh;
+}
+
+// 月まとめタブを1枚作る
+function createSummaryTab(ss, y, m) {
+  const tpl = findTemplateSummaryTab(ss);
+  if (!tpl) { Logger.log('見本にできる月まとめタブが見つかりません'); return null; }
+  const sh = copyTabInOrder(ss, tpl, summarySheetName(y, m));
+  const cols = Math.max(sh.getLastColumn(), 9);
+
+  // タイトル「令和10年3月　訪問日予定　月間まとめ」
+  const title = String(sh.getRange(1, 1).getValue());
+  const re = /^令和\d+年\d+月/;
+  sh.getRange(1, 1).setValue(re.test(title) ? title.replace(re, `令和${y - 2018}年${m}月`)
+                                            : `令和${y - 2018}年${m}月　訪問日予定　月間まとめ`);
+
+  // 見本の合計行・土日の色を読む
+  const last = sh.getLastRow();
+  const colA = sh.getRange(1, 1, last, 2).getValues();
+  let totalRow = 0;
+  for (let r = DATA_START_ROW; r <= last; r++) {
+    if (String(colA[r - 1][0]).replace(/\s|　/g, '') === '合計') { totalRow = r; break; }
+  }
+  if (!totalRow) { Logger.log(`月まとめの合計行が見つかりません: ${sh.getName()}`); return sh; }
+  let satBg = SUMMARY_SAT_BG, sunBg = SUMMARY_SUN_BG, dayBg = null;
+  for (let r = DATA_START_ROW; r < totalRow; r++) {
+    const wd = colA[r - 1][1];
+    const bg = sh.getRange(r, 1).getBackground();
+    if (wd === '土') satBg = bg;
+    else if (wd === '日') sunBg = bg;
+    else if (dayBg === null) dayBg = bg;
+  }
+  if (dayBg === null || dayBg === '#ffffff') dayBg = null; // 平日は色なし
+
+  // 行数をその月の日数に合わせる
+  const tplDays = totalRow - DATA_START_ROW;
+  const n = new Date(y, m, 0).getDate();
+  if (n > tplDays) {
+    sh.insertRowsBefore(totalRow, n - tplDays);
+    sh.getRange(DATA_START_ROW, 1, 1, cols)
+      .copyTo(sh.getRange(totalRow, 1, n - tplDays, cols), { formatOnly: true });
+    sh.setRowHeights(totalRow, n - tplDays, sh.getRowHeight(DATA_START_ROW));
+  } else if (n < tplDays) {
+    sh.deleteRows(DATA_START_ROW + n, tplDays - n);
+  }
+  const newTotal = DATA_START_ROW + n;
+
+  // 日付（文字の「3/1」）と曜日、土日の色
+  const ab = [], bgs = [];
+  for (let d = 1; d <= n; d++) {
+    const w = ['日', '月', '火', '水', '木', '金', '土'][new Date(y, m - 1, d).getDay()];
+    ab.push([`'${m}/${d}`, w]);
+    const bg = w === '土' ? satBg : (w === '日' ? sunBg : dayBg);
+    bgs.push(new Array(cols).fill(bg));
+  }
+  sh.getRange(DATA_START_ROW, 1, n, 2).setValues(ab);
+  sh.getRange(DATA_START_ROW, 3, n, cols - 2).clearContent().clearNote();
+  sh.getRange(DATA_START_ROW, 1, n, cols).setBackgrounds(bgs);
+
+  // 合計行の式（C〜H列）を日数に合わせて書き直す
+  const lastData = newTotal - 1;
+  const sums = [];
+  for (let c = 3; c <= Math.min(8, cols); c++) {
+    const L = String.fromCharCode(64 + c);
+    sums.push(`=SUM(${L}${DATA_START_ROW}:${L}${lastData})`);
+  }
+  sh.getRange(newTotal, 3, 1, sums.length).setFormulas([sums]);
+  trimSheetGrid(sh, cols);
+  return sh;
+}
+
+// 使っていない行・列を削る（スプレッドシートのセル数上限1,000万セル対策）
+function trimSheetGrid(sh, minCols) {
+  try {
+    const lr = Math.max(sh.getLastRow(), 1);
+    const lc = Math.max(sh.getLastColumn(), minCols || 1);
+    if (sh.getMaxRows() > lr) sh.deleteRows(lr + 1, sh.getMaxRows() - lr);
+    if (sh.getMaxColumns() > lc) sh.deleteColumns(lc + 1, sh.getMaxColumns() - lc);
+  } catch (e) { Logger.log(`行列の削減警告 「${sh.getName()}」: ${e.message}`); }
+}
+
+// その月の足りないタブ（まとめ＋月〜土）を作る
+// @return { created: 作成数, finished: 時間内に全部作れたか }
+function ensureMonthTabs(ss, y, m, deadline) {
+  let created = 0;
+  if (!ss.getSheetByName(summarySheetName(y, m))) {
+    if (createSummaryTab(ss, y, m)) created++;
+  }
+  const n = new Date(y, m, 0).getDate();
+  for (let d = 1; d <= n; d++) {
+    if (deadline && Date.now() > deadline) return { created, finished: false };
+    const date = new Date(y, m - 1, d);
+    if (date.getDay() === 0 && !CREATE_SUNDAY_TABS) continue;
+    if (!findSheetByDate(ss, date)) {
+      if (createDayTab(ss, date)) created++;
+    }
+  }
+  return { created, finished: true };
+}
+
+// 転記時：対象日のタブが無ければ、その月のタブを作ってから返す（日曜は予定がある場合だけ作る）
+function ensureDayTab(ss, date, allowSunday) {
+  ensureMonthTabs(ss, date.getFullYear(), date.getMonth() + 1, Date.now() + LAYOUT_TIME_BUDGET_MS);
+  let sh = findSheetByDate(ss, date);
+  if (!sh && date.getDay() === 0 && allowSunday) sh = createDayTab(ss, date);
+  return sh;
+}
+
+// 今月から TABS_AHEAD_MONTHS か月先までのタブを用意する（6分制限に備え時間で区切る）
+function ensureTabsAhead(showPopup, budgetMs) {
+  const t0 = Date.now();
+  const deadline = t0 + (budgetMs || LAYOUT_TIME_BUDGET_MS);
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const today = new Date();
+  let created = 0, finished = true;
+  for (let k = 0; k <= TABS_AHEAD_MONTHS; k++) {
+    const d = new Date(today.getFullYear(), today.getMonth() + k, 1);
+    const r = ensureMonthTabs(ss, d.getFullYear(), d.getMonth() + 1, deadline);
+    created += r.created;
+    if (!r.finished) { finished = false; break; }
+  }
+  const last = new Date(today.getFullYear(), today.getMonth() + TABS_AHEAD_MONTHS, 1);
+  const msg = `日付タブの作成: ${created}枚（令和${last.getFullYear() - 2018}年${last.getMonth() + 1}月まで）` +
+    (finished ? '' : '\nまだ残りがあります。もう一度実行してください。');
+  Logger.log(msg);
+  finishPopup(showPopup, msg);
+  return created;
+}
+
+function menuEnsureTabsAhead() { ensureTabsAhead(true); }
 
 
 // ============================================================
@@ -1311,7 +1741,7 @@ function diagnosePatientFolders() {
   Logger.log('=== 患者マスタ診断 開始 ===');
 
   // ROOTフォルダの生アクセス確認（全ID）
-  ROOT_FOLDER_IDS.forEach(entry => {
+  getRootEntries().forEach(entry => {
     const conf = (typeof entry === 'string') ? { id: entry } : entry;
     try {
       const root = DriveApp.getFolderById(conf.id);
@@ -1406,7 +1836,7 @@ function diagnosePatientFolders() {
 function testFacilityFolders() {
   Logger.log('=== 施設フォルダ 一括確認 開始 ===');
   let ok = 0, ng = 0;
-  ROOT_FOLDER_IDS.forEach(entry => {
+  getRootEntries().forEach(entry => {
     const conf = (typeof entry === 'string') ? { id: entry } : entry;
     try {
       const f = DriveApp.getFolderById(conf.id);
