@@ -28,6 +28,8 @@
 //      合計の =SUM 式は毎回「3行目〜合計行の1つ上」に書き直す（行の削除・挿入で #REF! や範囲ずれを起こさない）
 //      行を挿入する際の書式コピー元を既存の予定行に修正（見出し行の書式が移るのを防止）
 //   9. 氏名照合で旧字体・異体字を同じ字とみなす（斎/齋/齊、高/髙、崎/﨑 等。KANJI_VARIANTS）
+//  10. 前回の治療内容の探し方を強化（見出しの言葉が患者ごとに違っても拾える）
+//      行頭の日付で訪問ごとに区切って対象日より前の最新回 → 見出し → 最後の段落のまとまり の順
 // ============================================================
 // 【v10.0.0 の変更点】
 //   1. 施設フォルダを18件追加（鳴門病院・兼松病院ほか）＝ 計22ルート
@@ -176,8 +178,9 @@ const NON_NAME_WORDS = [
   '往診', '訪問', '口腔ケア', 'ケア',
 ];
 
-// 治療内容の記録ドキュメント抽出見出し（フェーズ2でtext抽出する際に使用）
-const CONTENT_HEADINGS = ['前回業務内容', '業務内容', '治療内容', '処置内容'];
+// 記録ドキュメントから治療内容を探すときの見出し（患者ごとに書き方が違うため、見つからなくても
+// 「日付で区切った最新の回」→「最後の段落のまとまり」の順で探す。extractRecordFromParas 参照）
+const CONTENT_HEADINGS = ['前回業務内容', '業務内容', '治療内容', '処置内容', '実施内容', '施術内容', '本日の処置', '今回の処置'];
 
 // ▼ 動作モード
 // 'label' = 記録ドキュメントの中身から短い単語（ケア/義歯 等）を作り、普通の文字で入力する（推奨）
@@ -428,7 +431,7 @@ function runSync(targetDate, showPopup) {
           else     biko = '記録ファイル未検出';
         } else { // 'label'（短い単語・既定）/ 'text'（文章そのまま）
           // 中身が空の記録（当日分の白紙など）は飛ばし、記載のある一番新しい記録を使う
-          const rec = getLatestRecordContent(p.folderId);
+          const rec = getLatestRecordContent(p.folderId, targetDate);
           if (!rec)          { contentCell = 'カルテなし'; biko = '記録ファイル未検出'; }
           else if (!rec.text) { contentCell = '記載なし'; }
           else {
@@ -1150,7 +1153,7 @@ function getLastBusinessContent(folderId) {
 // 治療内容の記載がある最初のものを返す。
 //   → 当日分の白紙の記録が一番新しくても、前回の記載を拾える
 // @return { text, url }（記載がどれにも無ければ text='' で一番新しい記録のURL）／ 記録なしは null
-function getLatestRecordContent(folderId) {
+function getLatestRecordContent(folderId, targetDate) {
   const docs = withRetry(() => {
     const files = DriveApp.getFolderById(folderId).getFilesByType(MimeType.GOOGLE_DOCS);
     const list = [];
@@ -1163,35 +1166,120 @@ function getLatestRecordContent(folderId) {
   if (docs.length === 0) return null;
   docs.sort((a, b) => b.t - a.t);
   for (const d of docs.slice(0, MAX_DOCS_TO_SCAN)) {
-    const text = extractBusinessContent(d.id);
+    const text = extractBusinessContent(d.id, targetDate);
     if (text) return { text, url: d.url };
   }
   return { text: '', url: docs[0].url };
 }
 
-// ドキュメント本文から「前回業務内容」等の見出し直後の段落を取り出す（見つからなければ ''）
-function extractBusinessContent(docId) {
+// 記録ドキュメントから「前回の治療内容」を取り出す（見つからなければ ''）
+//   targetDate: 転記の対象日（この日より前の記録を「前回」とみなす）
+function extractBusinessContent(docId, targetDate) {
   const paragraphs = withRetry(() => DocumentApp.openById(docId).getBody().getParagraphs(), 'openDoc');
-  let capturing = false;
-  const lines = [];
-  for (const para of paragraphs) {
-    const text = para.getText().trim();
-    if (capturing) {
-      if (para.getHeading() !== DocumentApp.ParagraphHeading.NORMAL && text !== '') break;
-      if (text !== '' && CONTENT_HEADINGS.some(kw => text === kw)) break;
-      if (text !== '') lines.push(text);
+  const paras = paragraphs.map(p => ({
+    text: p.getText().trim(),
+    isHeading: p.getHeading() !== DocumentApp.ParagraphHeading.NORMAL,
+  }));
+  return extractRecordFromParas(paras, targetDate || new Date());
+}
+
+// 段落の並び → 前回の治療内容（患者ごとに記録の書き方が違っても拾えるよう、3段階で探す）
+//   1) 日付で区切る：行頭の日付（R8.9.18 / 令和8年9月18日 / 2026/9/18 / 9/18 / 9月18日）で
+//      訪問ごとに区切り、対象日より前で一番新しい回の本文を使う（対象日より前が無ければ一番新しい回）
+//   2) 見出しで探す：CONTENT_HEADINGS を含む行の下（複数あれば一番最後＝最新の回）
+//   3) 最後のまとまり：空行で区切った最後の段落のまとまり
+//   いずれも「日付：」「氏名：」のような項目名だけの行しか無いもの（白紙の記録）は採用しない
+function extractRecordFromParas(paras, targetDate) {
+  const ref = new Date(targetDate.getFullYear(), targetDate.getMonth(), targetDate.getDate());
+
+  // 1) 日付で区切る
+  const entries = [];
+  let cur = null;
+  paras.forEach(p => {
+    const d = parseLeadingDate(p.text, ref);
+    if (d) { cur = { date: d.date, lines: d.rest ? [d.rest] : [] }; entries.push(cur); }
+    else if (cur && p.text) cur.lines.push(p.text);
+  });
+  const valid = entries.filter(e => hasRecordText(e.lines.join('\n')));
+  if (valid.length > 0) {
+    const before = valid.filter(e => e.date < ref);
+    const pool = before.length ? before : valid;
+    let best = pool[0];
+    pool.forEach(e => { if (e.date >= best.date) best = e; }); // 同じ日付なら後ろに書かれた方
+    return cleanRecordLines(best.lines);
+  }
+
+  // 2) 見出しで探す（一番最後に見つかったもの）
+  let found = '';
+  for (let i = 0; i < paras.length; i++) {
+    const kw = CONTENT_HEADINGS.find(k => paras[i].text.includes(k));
+    if (!kw) continue;
+    const lines = [];
+    const rest = paras[i].text.slice(paras[i].text.indexOf(kw) + kw.length).replace(/^[\s:：】\]）)]+/, '').trim();
+    if (rest) lines.push(rest);
+    for (let j = i + 1; j < paras.length; j++) {
+      const t = paras[j].text;
+      if (!t) { if (lines.length) break; else continue; }
+      if (paras[j].isHeading || CONTENT_HEADINGS.some(k => t.includes(k))) break;
+      lines.push(t);
     }
-    if (!capturing) {
-      const kw = CONTENT_HEADINGS.find(k => text.includes(k));
-      if (kw) {
-        capturing = true;
-        // 「業務内容：口腔ケア」のように見出しと同じ行に書かれている分も拾う
-        const rest = text.slice(text.indexOf(kw) + kw.length).replace(/^[\s:：】\]）)]+/, '').trim();
-        if (rest) lines.push(rest);
-      }
+    if (hasRecordText(lines.join('\n'))) found = cleanRecordLines(lines);
+  }
+  if (found) return found;
+
+  // 3) 最後のまとまり（空行区切り）
+  const blocks = [];
+  let blk = [];
+  paras.forEach(p => {
+    if (p.text) blk.push(p.text);
+    else if (blk.length) { blocks.push(blk); blk = []; }
+  });
+  if (blk.length) blocks.push(blk);
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (hasRecordText(blocks[i].join('\n'))) return cleanRecordLines(blocks[i]);
+  }
+  return '';
+}
+
+// 行頭の日付を読む。{date, rest(日付の後ろの文字)} または null
+//   月/日だけの書き方は、基準日より後になる場合は前年とみなす
+function parseLeadingDate(line, ref) {
+  const t = toHalfWidth(line).replace(/^[\s【\[（(〈<●■◆◇○・\-]+/, '');
+  let y, m, d, len;
+  let x = t.match(/^(?:令和|R)\s*(\d{1,2})\s*[年.\/\-]\s*(\d{1,2})\s*[月.\/\-]\s*(\d{1,2})\s*日?/i);
+  if (x) { y = 2018 + Number(x[1]); m = +x[2]; d = +x[3]; len = x[0].length; }
+  if (!x) {
+    x = t.match(/^(20\d{2})\s*[年.\/\-]\s*(\d{1,2})\s*[月.\/\-]\s*(\d{1,2})\s*日?/);
+    if (x) { y = +x[1]; m = +x[2]; d = +x[3]; len = x[0].length; }
+  }
+  if (!x) {
+    x = t.match(/^(\d{1,2})\s*(?:\/|月)\s*(\d{1,2})\s*日?(?!\d)/);
+    if (x) {
+      m = +x[1]; d = +x[2]; len = x[0].length; y = ref.getFullYear();
+      if (new Date(y, m - 1, d) > new Date(ref.getTime() + 86400000)) y--;
     }
   }
-  return lines.join('\n');
+  if (!x || m < 1 || m > 12 || d < 1 || d > 31) return null;
+  const rest = t.slice(len).replace(/^[\s)）】\]>〉:：\-]+/, '').replace(/^[(（][月火水木金土日][)）]\s*/, '').trim();
+  return { date: new Date(y, m - 1, d), rest };
+}
+
+// 項目名だけの行（「処置：」「氏名：」等）を除き、中身のある行だけを返す
+//   「次回予定」「次回：」など次回の予定から後ろは、今回の治療内容ではないので含めない
+function cleanRecordLines(lines) {
+  const out = [];
+  for (const l of lines) {
+    if (!l) continue;
+    if (/^[\s【\[(（]*次回/.test(l)) break;
+    if (/^[^：:]{1,12}[：:]\s*$/.test(l)) continue;
+    out.push(l);
+  }
+  return out.join('\n');
+}
+
+// 治療内容として意味のある文字（かな・漢字・英字が2文字以上続く）があるか
+function hasRecordText(text) {
+  return /[A-Za-z぀-ヿ㐀-鿿]{2,}/.test(cleanRecordLines(String(text || '').split('\n')));
 }
 
 // 治療内容の文章 → E列に出す短い単語（例:「義歯」「義歯・ケア」）
