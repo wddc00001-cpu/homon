@@ -5,7 +5,7 @@
 // 更新日: 2026-09-25
 // ============================================================
 // 【v10.2.0 の変更点】（本日分の試行結果を受けた修正）
-//   1. E列(治療内容)を「ケア」「義歯」等の短い単語で表示（単語をクリックで記録ドキュメントが開く）
+//   1. E列(治療内容)を「ケア」「義歯」等の短い単語で表示
 //      CONTENT_MODE='label'。単語の辞書は CONTENT_LABEL_RULES で調整する
 //      書き込んだ行は折り返さず（はみ出しは切り詰め）、行の高さを強制的に揃える
 //   2. 「PCM」等の患者ではない予定を転記しない
@@ -22,6 +22,8 @@
 //   5. 施設フォルダ・ペアカレンダーをスプレッドシートの「設定_施設」「設定_カレンダー」タブで管理
 //      （スタッフがGASを触らずに追加・停止できる。設定タブが無い間はコード内の定数を使用）
 //   6. 自動記入行の高さを既存タブと同じ 34px に変更（従来 21px で既存行と高さが違っていた）
+//   7. E列は普通の文字で入力（リンクにしない。CONTENT_LABEL_AS_LINK=true でリンク化も可）。
+//      記録は「記載のある一番新しいもの」を使う（当日分の白紙ドキュメントを飛ばす）
 // ============================================================
 // 【v10.0.0 の変更点】
 //   1. 施設フォルダを18件追加（鳴門病院・兼松病院ほか）＝ 計22ルート
@@ -160,7 +162,7 @@ const NON_NAME_WORDS = [
 const CONTENT_HEADINGS = ['前回業務内容', '業務内容', '治療内容', '処置内容'];
 
 // ▼ 動作モード
-// 'label' = 記録ドキュメントの中身から短い単語（ケア/義歯 等）を作り、その単語をリンクにする（推奨）
+// 'label' = 記録ドキュメントの中身から短い単語（ケア/義歯 等）を作り、普通の文字で入力する（推奨）
 // 'link'  = 「前回記録を開く」の固定文字でリンク挿入
 // 'text'  = 中身の文章をそのまま転記（長くなるため非推奨）
 const CONTENT_MODE = 'label';
@@ -179,6 +181,8 @@ const CONTENT_LABEL_RULES = [
 ];
 const CONTENT_LABEL_MAX      = 2;  // 1セルに出す単語の最大数（例: 義歯・ケア）
 const CONTENT_FALLBACK_CHARS = 6;  // 辞書に当てはまらないとき、記録の先頭何文字を出すか
+const CONTENT_LABEL_AS_LINK  = false; // true にするとE列の単語をリンク（クリックで記録が開く）にする。既定は普通の文字
+const MAX_DOCS_TO_SCAN       = 5;     // 中身が空の記録（当日分の白紙など）を飛ばして、新しい順に何件まで読むか
 // 'overwrite'   = 前回の自動生成行を消してから入れ直す（毎回きれいに再生成・推奨）
 // 'append_dedup'= 既存と重複しない行だけ追記
 const WRITE_MODE   = 'overwrite';
@@ -396,22 +400,21 @@ function runSync(targetDate, showPopup) {
       let contentCell = '';
       let biko        = '';
       try {
-        if (CONTENT_MODE === 'label' || CONTENT_MODE === 'link') {
+        if (CONTENT_MODE === 'link') {
           const doc = getLatestDoc(p.folderId);
-          if (doc) {
-            let label = LINK_LABEL;
-            if (CONTENT_MODE === 'label') {
-              label = makeContentLabel(extractBusinessContent(doc.id)) || LINK_LABEL;
-            }
-            contentCell = `=HYPERLINK("${doc.url}","${label.replace(/"/g, '""')}")`;
-          } else {
-            biko = '記録ファイル未検出';
+          if (doc) contentCell = `=HYPERLINK("${doc.url}","${LINK_LABEL}")`;
+          else     biko = '記録ファイル未検出';
+        } else { // 'label'（短い単語・既定）/ 'text'（文章そのまま）
+          // 中身が空の記録（当日分の白紙など）は飛ばし、記載のある一番新しい記録を使う
+          const rec = getLatestRecordContent(p.folderId);
+          if (!rec)          { contentCell = 'カルテなし'; biko = '記録ファイル未検出'; }
+          else if (!rec.text) { contentCell = '記載なし'; }
+          else {
+            const shown = CONTENT_MODE === 'label' ? makeContentLabel(rec.text) : rec.text;
+            contentCell = (CONTENT_MODE === 'label' && CONTENT_LABEL_AS_LINK)
+              ? `=HYPERLINK("${rec.url}","${shown.replace(/"/g, '""')}")`
+              : shown;
           }
-        } else { // 'text'（フェーズ2）
-          const text = getLastBusinessContent(p.folderId);
-          if (text === null)    { contentCell = 'カルテなし'; biko = '記録ファイル未検出'; }
-          else if (text === '') { contentCell = '記載なし'; }
-          else                  { contentCell = text; }
         }
       } catch (e) {
         contentCell = '';
@@ -1062,9 +1065,31 @@ function getLatestDoc(folderId) {
 //   CONTENT_MODE='text'（本文をそのまま転記）と 'label'（短い単語に変換）で使用
 // ============================================================
 function getLastBusinessContent(folderId) {
-  const doc = getLatestDoc(folderId);
-  if (!doc) return null;
-  return extractBusinessContent(doc.id);
+  const rec = getLatestRecordContent(folderId);
+  return rec ? rec.text : null;
+}
+
+// 患者フォルダ内のGoogleドキュメントを新しい順（最終更新日時）に最大 MAX_DOCS_TO_SCAN 件読み、
+// 治療内容の記載がある最初のものを返す。
+//   → 当日分の白紙の記録が一番新しくても、前回の記載を拾える
+// @return { text, url }（記載がどれにも無ければ text='' で一番新しい記録のURL）／ 記録なしは null
+function getLatestRecordContent(folderId) {
+  const docs = withRetry(() => {
+    const files = DriveApp.getFolderById(folderId).getFilesByType(MimeType.GOOGLE_DOCS);
+    const list = [];
+    while (files.hasNext()) {
+      const f = files.next();
+      list.push({ id: f.getId(), url: f.getUrl(), t: f.getLastUpdated().getTime() });
+    }
+    return list;
+  }, 'listDocs');
+  if (docs.length === 0) return null;
+  docs.sort((a, b) => b.t - a.t);
+  for (const d of docs.slice(0, MAX_DOCS_TO_SCAN)) {
+    const text = extractBusinessContent(d.id);
+    if (text) return { text, url: d.url };
+  }
+  return { text: '', url: docs[0].url };
 }
 
 // ドキュメント本文から「前回業務内容」等の見出し直後の段落を取り出す（見つからなければ ''）
