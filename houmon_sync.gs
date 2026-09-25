@@ -24,6 +24,9 @@
 //   6. 自動記入行の高さを既存タブと同じ 34px に変更（従来 21px で既存行と高さが違っていた）
 //   7. E列は普通の文字で入力（リンクにしない。CONTENT_LABEL_AS_LINK=true でリンク化も可）。
 //      記録は「記載のある一番新しいもの」を使う（当日分の白紙ドキュメントを飛ばす）
+//   8. 転記後、最後の予定行のすぐ下に合計行を詰める（間の空行を削除。BLANK_ROWS_ABOVE_FOOTER で空行数を指定）
+//      合計の =SUM 式は毎回「3行目〜合計行の1つ上」に書き直す（行の削除・挿入で #REF! や範囲ずれを起こさない）
+//      行を挿入する際の書式コピー元を既存の予定行に修正（見出し行の書式が移るのを防止）
 // ============================================================
 // 【v10.0.0 の変更点】
 //   1. 施設フォルダを18件追加（鳴門病院・兼松病院ほか）＝ 計22ルート
@@ -209,6 +212,9 @@ const C = {
 };
 
 // ▼ レイアウト正規化（行高さ／列幅）
+// 転記後、最後の予定行のすぐ下に「合計」行が来るよう、間の空行を削除する（書式は各行のまま）
+//   0 = 空行を残さない / 1以上 = 手書き追記用にその行数だけ空行を残す
+const BLANK_ROWS_ABOVE_FOOTER = 0;
 const ROW_HEIGHT_DATA   = 34;      // 予定行の標準高さ(px)。既存の日付タブの予定行(25.5pt=34px)に合わせる
 
 // ▼ 日付タブ・月まとめタブの自動作成
@@ -244,6 +250,7 @@ function onOpen() {
     .addItem('患者マスタ診断', 'diagnosePatientFolders')
     .addItem('患者マスタ 事前構築', 'prebuildPatientMaster')
     .addItem('患者マスタ キャッシュ削除', 'clearMasterCache')
+    .addItem('記録ドキュメントの読み取り確認', 'diagnoseRecordDoc')
     .addSeparator()
     .addItem('設定タブを作成（初回のみ）', 'createSettingsSheets')
     .addItem('設定の確認（施設フォルダ・カレンダー）', 'checkSettings')
@@ -453,6 +460,8 @@ function runSync(targetDate, showPopup) {
       sheet.setRowHeightsForced(startRow, rows.length, ROW_HEIGHT_DATA);
     } catch (e) { Logger.log(`行高さ設定警告: ${e.message}`); }
     Logger.log(`書き込み: ${startRow}行目から ${rows.length}件（重複スキップ ${skipped}件）`);
+    // 合計行を最後の予定行のすぐ下へ詰め、合計の式を予定行の範囲に合わせる
+    try { compactToFooter(sheet); } catch (e) { Logger.log(`合計行の位置調整警告: ${e.message}`); }
   } else {
     Logger.log(`書き込み対象なし（重複スキップ ${skipped}件）`);
   }
@@ -547,9 +556,59 @@ function clearAutoRows(sheet) {
     if (notes[i][0] === AUTO_MARKER) target.add(DATA_START_ROW + i);
   }
   const targetRows = Array.from(target).filter(r => r >= DATA_START_ROW).sort((a, b) => a - b);
+  // 予定行が全部消えると合計式の範囲がなくなり #REF! になるため、
+  // 予定行が1行も残らない場合は先頭の1行だけ「中身を消して残す」（書式・罫線はそのまま）
+  const footer = findFooterRow(sheet);
+  let keepRow = 0;
+  if (footer > DATA_START_ROW && targetRows.length > 0) {
+    const inRegion = targetRows.filter(r => r < footer).length;
+    if (inRegion >= footer - DATA_START_ROW) keepRow = targetRows[0];
+  }
   // 下から削除（行番号のズレを防ぐ／数式範囲は自動調整）。行メタデータも行と一緒に消える
-  for (let i = targetRows.length - 1; i >= 0; i--) sheet.deleteRow(targetRows[i]);
+  for (let i = targetRows.length - 1; i >= 0; i--) {
+    const r = targetRows[i];
+    if (r === keepRow) {
+      sheet.getRange(r, 1, 1, TOTAL_COLS).clearContent().clearNote();
+      sheet.getRange(`${r}:${r}`).getDeveloperMetadata()
+        .forEach(md => { if (md.getKey() === AUTO_META_KEY) md.remove(); });
+    } else {
+      sheet.deleteRow(r);
+    }
+  }
   return targetRows.length;
+}
+
+// 最後の予定行と「合計」行の間の空行を削除し、合計行を最後の予定行のすぐ下に詰める
+//   ・削除するのは「最後に記入のある行」より下の、A〜T列が完全に空の行だけ（手入力行は消さない）
+//   ・予定行は最低1行残す（合計式の範囲を保つため）
+//   ・行を削除するだけなので、残る行・合計行・AM/PM行の色や罫線は変わらない
+function compactToFooter(sheet) {
+  const footer = findFooterRow(sheet);
+  if (!footer || footer <= DATA_START_ROW) return;
+  const vals = sheet.getRange(DATA_START_ROW, 1, footer - DATA_START_ROW, TOTAL_COLS).getValues();
+  let lastUsed = DATA_START_ROW - 1;
+  vals.forEach((r, i) => { if (r.some(v => v !== '' && v !== null)) lastUsed = DATA_START_ROW + i; });
+  const keepTo = Math.max(lastUsed + BLANK_ROWS_ABOVE_FOOTER, DATA_START_ROW);
+  const delCount = (footer - 1) - keepTo;
+  if (delCount > 0) {
+    sheet.deleteRows(keepTo + 1, delCount);
+    Logger.log(`合計行の上の空行を${delCount}行削除しました`);
+  }
+  fixFooterSums(sheet);
+}
+
+// 合計行の =SUM(…) を「3行目〜合計行の1つ上」に書き直す（行の挿入・削除で範囲がずれても正しく保つ）
+//   単純な =SUM(…) の式が入っているセルだけを1つずつ書き換え、「合計」の文字や書式には触れない
+function fixFooterSums(sheet) {
+  const footer = findFooterRow(sheet);
+  if (!footer || footer - 1 < DATA_START_ROW) return;
+  const formulas = sheet.getRange(footer, 1, 1, TOTAL_COLS).getFormulas()[0];
+  formulas.forEach((f, i) => {
+    if (!/^=SUM\([^()]*\)$/i.test(f)) return;
+    const L  = String.fromCharCode(65 + i);
+    const nf = `=SUM(${L}${DATA_START_ROW}:${L}${footer - 1})`;
+    if (f.replace(/\s/g, '').toUpperCase() !== nf.toUpperCase()) sheet.getRange(footer, i + 1).setFormula(nf);
+  });
 }
 
 // 自動生成行に目印（行メタデータ）を付ける。行の挿入・削除・並べ替えにも追従する
@@ -634,8 +693,11 @@ function ensureRoom(sheet, startRow, count, footer) {
       const insertAt = Math.max(footer - 1, startRow); // 合計の1つ上（SUM範囲内）に挿入
       sheet.insertRowsBefore(insertAt, need);
       // 挿入直後、新規行は [insertAt .. insertAt+need-1]。既存予定行の書式(罫線等)をコピー
+      //   見本は必ず既存の予定行にする（挿入したばかりの行・合計行を見本にすると書式が崩れる）
+      //   ・合計行の直前に挿入した場合 → 挿入位置の1つ上の予定行
+      //   ・予定行の途中に挿入した場合 → 挿入前に insertAt にあった予定行（挿入後は insertAt+need）
       try {
-        const srcRow = (startRow < insertAt) ? startRow : DATA_START_ROW; // 書式の見本行
+        const srcRow = (insertAt >= footer) ? Math.max(insertAt - 1, DATA_START_ROW) : insertAt + need; // 書式の見本行
         sheet.getRange(srcRow, 1, 1, TOTAL_COLS)
              .copyTo(sheet.getRange(insertAt, 1, need, TOTAL_COLS), { formatOnly: true });
         // 挿入行は直前行の高さを継承するため、明示的に統一する
@@ -1104,7 +1166,15 @@ function extractBusinessContent(docId) {
       if (text !== '' && CONTENT_HEADINGS.some(kw => text === kw)) break;
       if (text !== '') lines.push(text);
     }
-    if (!capturing && CONTENT_HEADINGS.some(kw => text.includes(kw))) capturing = true;
+    if (!capturing) {
+      const kw = CONTENT_HEADINGS.find(k => text.includes(k));
+      if (kw) {
+        capturing = true;
+        // 「業務内容：口腔ケア」のように見出しと同じ行に書かれている分も拾う
+        const rest = text.slice(text.indexOf(kw) + kw.length).replace(/^[\s:：】\]）)]+/, '').trim();
+        if (rest) lines.push(rest);
+      }
+    }
   }
   return lines.join('\n');
 }
@@ -1851,6 +1921,45 @@ function diagnosePatientFolders() {
     `番号重複: ${dup.length}件 / 同姓同名: ${sameName.length}件\n` +
     `未登録フォルダ: ${master.unmatched.length}件\n` +
     `詳細は実行ログを確認してください。`);
+}
+
+
+// ============================================================
+// 【診断用・メニュー】記録ドキュメントの読み取り確認
+//   カルテ番号を入力すると、その患者の記録ドキュメント（新しい順）と、
+//   一番新しい記録の段落構成（見出しの種類・先頭30文字）を実行ログに出す。
+//   E列が「記載なし」になる原因（見出し名の違い・表の中に書いている等）を調べるために使う
+// ============================================================
+function diagnoseRecordDoc() {
+  const ui = SpreadsheetApp.getUi();
+  const res = ui.prompt('記録ドキュメントを確認する患者のカルテ番号を入力してください', ui.ButtonSet.OK_CANCEL);
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+  const no = toHalfWidth(res.getResponseText()).trim();
+  const master = buildPatientMaster(SpreadsheetApp.openById(SPREADSHEET_ID));
+  const recs = master.byNumber.get(no) || [];
+  if (recs.length === 0) { ui.alert(`カルテ番号 ${no} の患者フォルダが見つかりません`); return; }
+
+  recs.forEach(rec => {
+    Logger.log(`=== [${rec.facility}] №${rec.patientNo} ${rec.patientName} ===`);
+    const files = DriveApp.getFolderById(rec.folderId).getFilesByType(MimeType.GOOGLE_DOCS);
+    const docs = [];
+    while (files.hasNext()) { const f = files.next(); docs.push(f); }
+    docs.sort((a, b) => b.getLastUpdated() - a.getLastUpdated());
+    Logger.log(`記録ドキュメント ${docs.length}件（新しい順）: ` +
+      docs.slice(0, 10).map(f => `「${f.getName()}」${fmtDate(f.getLastUpdated())}`).join(' / '));
+    docs.slice(0, 2).forEach(f => {
+      Logger.log(`--- 「${f.getName()}」の段落（先頭80件） / 抽出結果: "${extractBusinessContent(f.getId()).slice(0, 60)}"`);
+      const paras = DocumentApp.openById(f.getId()).getBody().getParagraphs();
+      paras.slice(0, 80).forEach((p, i) => {
+        const t = p.getText().trim();
+        if (!t) return;
+        const inTable = p.getParent() && p.getParent().getType() === DocumentApp.ElementType.TABLE_CELL;
+        Logger.log(`${i}: [${p.getHeading()}${inTable ? '/表' : ''}] ${t.slice(0, 30)}`);
+      });
+    });
+  });
+  ui.alert('実行ログに記録ドキュメントの構成を出力しました。\n' +
+    'Apps Script の「実行数」から今回の実行を開き、ログを確認してください。');
 }
 
 
