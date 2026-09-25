@@ -1,8 +1,15 @@
 // ============================================================
 // 訪問歯科 カレンダー → スプレッドシート 自動転記スクリプト
-// バージョン: 10.0.0（要件定義書 v0.2 フェーズ1対応）
+// バージョン: 10.1.0（要件定義書 v0.2 フェーズ1対応）
 // 実行アカウント: wadadc.houmon@gmail.com
-// 更新日: 2026-09-17
+// 更新日: 2026-09-25
+// ============================================================
+// 【v10.1.0 の変更点】
+//   1. 上書き(overwrite)時、手で修正された自動生成行は削除せず保持する
+//      （要確認行を事務担当が補完した後に再実行しても消えない）
+//   2. F4: 氏名を特定できなかった予定に、部分一致の候補患者を併記する
+//      患者フォルダ名末尾の敬称（様/さま/さん/殿）を除去して照合する
+//   3. キャッシュの分割サイズをバイト基準に修正（日本語3バイトで100KB超過→保存失敗していた）
 // ============================================================
 // 【v10.0.0 の変更点】
 //   1. 施設フォルダを18件追加（鳴門病院・兼松病院ほか）＝ 計22ルート
@@ -116,6 +123,8 @@ const LINK_LABEL   = '前回記録を開く';
 // 'append_dedup'= 既存と重複しない行だけ追記
 const WRITE_MODE   = 'overwrite';
 const AUTO_MARKER  = '__訪問予定表_自動生成__'; // 自動生成行の目印（A列メモ・非表示/非印刷）
+// overwrite時、手で修正された自動生成行を削除せず残す（false で v10.0 と同じ全削除）
+const KEEP_EDITED_ROWS = true;
 const USE_CACHE    = true;        // 患者マスタをキャッシュ
 const MAX_RETRY    = 3;           // API一時エラー時のリトライ回数
 // A〜Gのみ自動記入し、H〜T（O/P/Q含む）は手動運用とする。
@@ -123,11 +132,18 @@ const MAX_RETRY    = 3;           // API一時エラー時のリトライ回数
 const FILL_VISIT_TYPE = false;
 // 要確認理由をT列(備考)にも書き出す場合は true（既定は実行ログにのみ出力）
 const WRITE_BIKO_TO_SHEET = false;
+// F4: 氏名未検出の予定に、部分一致の候補患者をD列(氏名)へ併記する
+const CANDIDATES_IN_NAME = true;
+const MAX_CANDIDATES     = 3;     // 併記する候補の最大数
+const HONORIFIC_RE       = /(様|さま|サマ|さん|殿)$/; // 患者フォルダ名末尾から除去する敬称
 
 const DATA_START_ROW    = 3;
 const TOTAL_COLS        = 20;      // A〜T
 const CACHE_TTL_SEC     = 6 * 60 * 60; // 患者マスタキャッシュの保持時間（6時間）
-const CACHE_CHUNK_SIZE  = 90000;       // 1キーあたりの保存サイズ（CacheService上限100KB対策）
+// 1キーあたりの保存文字数。CacheServiceの上限は「100KB（バイト）」で、
+// 日本語は1文字最大3バイトになるため、30000文字（最大約90KB）に抑える
+const CACHE_CHUNK_SIZE  = 30000;
+const CACHE_VERSION     = 'v101';      // マスタの形式を変えたら更新（古いキャッシュを使わない）
 const LOG_SHEET_NAME    = '実行ログ';
 
 // 列インデックス（0基点）
@@ -251,11 +267,16 @@ function runSync(targetDate, showPopup) {
 
   // Step4: 書き込みモード準備
   //   overwrite    : システムが前回入れた行（マーカー付き）を消してから入れ直す
+  //                  ※手で修正された行は残し、同じ予定の行は再生成しない（KEEP_EDITED_ROWS）
   //   append_dedup : 既存行と重複しないものだけ追記
   let existingKeys = new Set();
+  let kept = 0;
   if (WRITE_MODE === 'overwrite') {
-    const cleared = clearAutoRows(sheet);
-    if (cleared > 0) Logger.log(`前回の自動生成行を${cleared}行クリアしました`);
+    const res = clearAutoRows(sheet);
+    kept = res.kept;
+    existingKeys = res.keptKeys;
+    if (res.cleared > 0) Logger.log(`前回の自動生成行を${res.cleared}行クリアしました`);
+    if (kept > 0) Logger.log(`手で修正された自動生成行を${kept}行保持しました（再生成しません）`);
   } else if (WRITE_MODE === 'append_dedup') {
     existingKeys = loadExistingKeys(sheet);
   }
@@ -269,10 +290,16 @@ function runSync(targetDate, showPopup) {
     if (patients.length === 0) {
       // F2/F4: 患者を特定できない → 要確認行
       const facility = detectFacility(ev.title, master);
+      // F4: 部分一致の候補（姓一致・フォルダ名との表記ゆれ等）を併記
+      const cands    = findNameCandidates(ev.title, master, facility);
+      const candText = formatCandidates(cands);
+      if (candText) Logger.log(`要確認: "${ev.title}" → 候補 ${candText}`);
       const row = buildRow({
         ev, facilityName: facility, home: facility ? isHome(facility) : false,
-        patientNo: '要確認', patientName: ev.title, contentCell: '',
-        biko: `氏名未検出（元タイトル: ${ev.title}）`,
+        patientNo: '要確認',
+        patientName: (CANDIDATES_IN_NAME && candText) ? `${ev.title}（候補: ${candText}）` : ev.title,
+        contentCell: '',
+        biko: `氏名未検出（元タイトル: ${ev.title}）` + (candText ? ` 候補: ${candText}` : ''),
       });
       if (pushUnique(rows, row, existingKeys)) { summary.written++; summary.review++; } else skipped++;
       continue;
@@ -335,9 +362,14 @@ function runSync(targetDate, showPopup) {
     const startRow = getWriteStart(sheet, footer);    // フッター手前の最初の空き行
     Logger.log(`レイアウト: フッター行=${footer || '未検出'} / 書込開始=${startRow} / 必要行数=${rows.length}`);
     ensureRoom(sheet, startRow, rows.length, footer); // 不足分の行を確保
-    withRetry(() => sheet.getRange(startRow, 1, rows.length, TOTAL_COLS).setValues(rows), 'setValues');
+    const range = sheet.getRange(startRow, 1, rows.length, TOTAL_COLS);
+    withRetry(() => range.setValues(rows), 'setValues');
     // 自動生成行の目印（A列に見えないメモ）を付与 → 次回の上書き対象になる
-    const notes = rows.map(() => [AUTO_MARKER]);
+    //   メモには「予定キー」と「書き込み直後の内容の指紋」を持たせ、
+    //   次回実行時に内容が変わっていれば（＝手で修正されていれば）削除せず残す
+    SpreadsheetApp.flush();
+    const prints = rowFingerprints(range);
+    const notes  = rows.map((r, i) => [buildAutoNote(rowKey(r[C.NO], r[C.NAME], r[C.TIME]), prints[i])]);
     withRetry(() => sheet.getRange(startRow, 1, rows.length, 1).setNotes(notes), 'setNotes');
     // 追加した行の高さを統一（行高さが揃わない不具合の予防）
     try { sheet.setRowHeights(startRow, rows.length, ROW_HEIGHT_DATA); }
@@ -350,13 +382,14 @@ function runSync(targetDate, showPopup) {
   // Step7: F7 アクセスログ
   writeAccessLog(ss, summary);
 
-  Logger.log(`=== 完了：転記${summary.written} / 要確認${summary.review} / エラー${summary.errors}（重複スキップ${skipped}） ===`);
+  Logger.log(`=== 完了：転記${summary.written} / 要確認${summary.review} / エラー${summary.errors}（重複スキップ${skipped} / 手修正保持${kept}） ===`);
   finishPopup(showPopup,
     `対象日: ${summary.targetDate}\n` +
     `転記: ${summary.written}件\n` +
     `要確認: ${summary.review}件\n` +
     `エラー: ${summary.errors}件\n` +
-    `重複スキップ: ${skipped}件`);
+    `重複スキップ: ${skipped}件` +
+    (kept > 0 ? `\n手修正のため保持: ${kept}行` : ''));
   return summary;
 }
 
@@ -425,18 +458,54 @@ function loadExistingKeys(sheet) {
 // overwrite用：システムが前回入れた行（A列マーカー付き）だけを削除する
 //   手入力行（マーカーなし）や合計・フッターは触らない。
 //   行ごと削除するため、前回挿入した行が積み重ならず、フッターは元位置に戻る。
+//   KEEP_EDITED_ROWS=true のとき、書き込み後に手で修正された行（内容の指紋が
+//   メモと一致しない行）は削除せず残し、その予定キーを返す（同じ予定は再生成しない）。
+//   ※v10.0 形式のメモ（マーカーのみ・指紋なし）の行は従来通り削除する
+// @return { cleared: 削除行数, kept: 保持行数, keptKeys: Set<予定キー> }
 function clearAutoRows(sheet) {
+  const res  = { cleared: 0, kept: 0, keptKeys: new Set() };
   const last = sheet.getLastRow();
-  if (last < DATA_START_ROW) return 0;
+  if (last < DATA_START_ROW) return res;
   const n = last - DATA_START_ROW + 1;
+  const range = sheet.getRange(DATA_START_ROW, 1, n, TOTAL_COLS);
   const notes = sheet.getRange(DATA_START_ROW, 1, n, 1).getNotes(); // A列のメモ
+  let prints = null; // 指紋は保持判定が必要なときだけ読む
   const targetRows = [];
   for (let i = 0; i < n; i++) {
-    if (notes[i][0] === AUTO_MARKER) targetRows.push(DATA_START_ROW + i);
+    const info = parseAutoNote(notes[i][0]);
+    if (!info) continue;
+    if (KEEP_EDITED_ROWS && info.print) {
+      if (!prints) prints = rowFingerprints(range);
+      if (prints[i] !== info.print) {
+        res.kept++;
+        if (info.key) res.keptKeys.add(info.key);
+        continue;
+      }
+    }
+    targetRows.push(DATA_START_ROW + i);
   }
   // 下から削除（行番号のズレを防ぐ／数式範囲は自動調整）
   for (let i = targetRows.length - 1; i >= 0; i--) sheet.deleteRow(targetRows[i]);
-  return targetRows.length;
+  res.cleared = targetRows.length;
+  return res;
+}
+
+// 自動生成行のメモ： 1行目=マーカー / 2行目=予定キー / 3行目=内容の指紋
+function buildAutoNote(key, print) {
+  return `${AUTO_MARKER}\n${key}\n${print}`;
+}
+// 自動生成行のメモなら {key, print} を返す（v10.0形式は key/print が空）。それ以外は null
+function parseAutoNote(note) {
+  const lines = String(note || '').split('\n');
+  if (lines[0] !== AUTO_MARKER) return null;
+  return { key: lines[1] || '', print: lines[2] || '' };
+}
+// 範囲の各行の「内容の指紋」（数式があれば数式、なければ表示値でハッシュ）
+//   書き込み直後とシート上の現状を同じ方法で読むため、時刻の表示形式等の違いに影響されない
+function rowFingerprints(range) {
+  const disp = range.getDisplayValues();
+  const fmls = range.getFormulas();
+  return disp.map((r, i) => simpleHash(r.map((v, j) => fmls[i][j] || v).join('\u0001')));
 }
 
 // フッター開始位置（「合計」行 or AM/PM集計行）を探す。無ければ0
@@ -607,6 +676,56 @@ function extractPatientsFromTitle(title, master) {
 
 
 // ============================================================
+// F4 部分一致候補：氏名を特定できなかった予定について、候補患者を探す
+//   タイトル中のどこかから始まる文字列と、患者氏名の「先頭からの一致文字数」を点数にする
+//   （姓だけの予定「山田」→ 山田太郎、フォルダ名との表記ゆれ「田中花子」→ 田中はなこ 等）
+//   2文字以上一致した患者を候補とし、施設名がタイトルにあればその施設の患者を優先する
+// @return rec[]（点数の高い順、最大 MAX_CANDIDATES 件。.total に候補の総数）
+// ============================================================
+function findNameCandidates(title, master, facilityHint) {
+  const cleaned = toHalfWidth(title)
+    .replace(/\d{1,2}[:：]\d{2}\s*(頃|ごろ|前後|くらい)?/g, ' ')
+    .replace(/[「」『』【】\[\]()（）]/g, ' ');
+  // 施設名そのものは候補判定に使わない（施設名と同じ文字で始まる患者の誤ヒット防止）
+  let normTitle = normalizeStr(cleaned);
+  if (facilityHint) normTitle = normTitle.split(normalizeStr(facilityHint)).join(' ');
+
+  const scored = [];
+  master.list.forEach(rec => {
+    const name = rec.normName;
+    if (name.length < 2) return;
+    let best = 0;
+    for (let i = normTitle.indexOf(name[0]); i !== -1; i = normTitle.indexOf(name[0], i + 1)) {
+      let k = 0;
+      while (k < name.length && i + k < normTitle.length && normTitle[i + k] === name[k]) k++;
+      if (k > best) best = k;
+    }
+    if (best >= 2) scored.push({ rec, score: best, sameFac: !!facilityHint && rec.facility === facilityHint });
+  });
+  if (scored.length === 0) return [];
+
+  // 施設名がタイトルにあり、その施設に候補がいれば、その施設の候補だけに絞る
+  const pool = scored.some(s => s.sameFac) ? scored.filter(s => s.sameFac) : scored;
+  pool.sort((a, b) => b.score - a.score);
+  // 最高点との差が大きい候補（姓の1文字目だけ一致した等）は落とす
+  const top = pool[0].score;
+  const all = pool.filter(s => s.score >= Math.max(2, top - 1)).map(s => s.rec);
+  const res = all.slice(0, MAX_CANDIDATES);
+  res.total = all.length; // 表示しきれない件数（「他n件」）の計算用
+  return res;
+}
+
+// 候補の表示文字列（例: 山田太郎№0123[藍寿苑] / 山田花子№0456[在宅] 他2件）
+function formatCandidates(cands) {
+  if (!cands || cands.length === 0) return '';
+  const shown = cands.slice(0, MAX_CANDIDATES)
+    .map(r => `${r.patientName}№${r.patientNo}[${r.isHome ? '在宅' : r.facility}]`);
+  const rest = (cands.total || cands.length) - shown.length;
+  return shown.join(' / ') + (rest > 0 ? ` 他${rest}件` : '');
+}
+
+
+// ============================================================
 // F3 患者マスタ構築（キャッシュ優先）
 //   rec = { patientNo, patientName, normName, folderId, facility, ward, isHome, key }
 // ============================================================
@@ -726,7 +845,8 @@ function addPatientFolder(master, patFolder, facility, facSet, ward) {
     return false;
   }
   const patientNo   = m[1];
-  const patientName = m[2].split(/[【(\[（_＿]/)[0].replace(/[　\s]+/g, '').trim();
+  const patientName = m[2].split(/[【(\[（_＿]/)[0].replace(/[　\s]+/g, '').trim()
+    .replace(HONORIFIC_RE, ''); // 「山田太郎様」→「山田太郎」（タイトル側に敬称が無くても一致させる）
   addMasterRec(master, {
     patientNo, patientName, folderId: patFolder.getId(),
     facility, ward: ward || '', isHome: isHome(facility),
@@ -768,7 +888,7 @@ function rootSignature() {
     .join(',');
 }
 function cacheKeyBase() {
-  return 'patientMaster_' + fmtDate(new Date()) + '_' + simpleHash(rootSignature());
+  return 'patientMaster_' + CACHE_VERSION + '_' + fmtDate(new Date()) + '_' + simpleHash(rootSignature());
 }
 function simpleHash(s) {
   let h = 0;
@@ -818,9 +938,14 @@ function saveMasterCache(master) {
     const base  = cacheKeyBase();
     const obj   = {};
     let n = 0;
-    for (let i = 0; i < raw.length; i += CACHE_CHUNK_SIZE) {
-      obj[base + '_' + n] = raw.substring(i, i + CACHE_CHUNK_SIZE);
+    for (let i = 0; i < raw.length; ) {
+      let end = Math.min(i + CACHE_CHUNK_SIZE, raw.length);
+      // サロゲートペア（𠮷 等の4バイト文字）を境界で分断しない
+      const c = raw.charCodeAt(end - 1);
+      if (end < raw.length && c >= 0xD800 && c <= 0xDBFF) end--;
+      obj[base + '_' + n] = raw.substring(i, end);
       n++;
+      i = end;
     }
     obj[base + '_n'] = String(n);
     cache.putAll(obj, CACHE_TTL_SEC);
@@ -836,7 +961,7 @@ function clearMasterCacheQuiet() {
     const base  = cacheKeyBase();
     const nStr  = cache.get(base + '_n');
     const keys  = [base + '_n'];
-    const n = nStr ? Number(nStr) : 20; // 件数不明時も念のため先頭20チャンクを削除
+    const n = nStr ? Number(nStr) : 50; // 件数不明時も念のため先頭50チャンクを削除
     for (let i = 0; i < n; i++) keys.push(base + '_' + i);
     cache.removeAll(keys);
   } catch (e) { Logger.log(`キャッシュ削除失敗: ${e.message}`); }
@@ -1204,7 +1329,8 @@ function diagnosePatientFolders() {
     const shown = ps.map(p => p.ambiguous
       ? `【要確認】${p.reason}`
       : `[${p.facility || '在宅'}]${p.patientNo}${p.patientName}`).join(', ');
-    Logger.log(`「${t}」→ ${shown || '(患者なし)'}`);
+    const cand = ps.length === 0 ? formatCandidates(findNameCandidates(t, master, detectFacility(t, master))) : '';
+    Logger.log(`「${t}」→ ${shown || '(患者なし)'}${cand ? ' ／候補: ' + cand : ''}`);
   });
 
   // F3.5 リンク取得テスト（先頭患者1名）
